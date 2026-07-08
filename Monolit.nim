@@ -13,8 +13,9 @@
 #      nim c -d:release --threads:on --os:windows Monolit.nim
 # ==============================================================================
 
-import src/gui
-import src/ffmpeg_api  # только ради av_log_set_level — настраиваем уровень лога FFmpeg
+# src/ffmpeg_api нужен здесь только ради av_log_set_level — настраиваем
+# уровень лога FFmpeg ниже, до передачи управления в src/gui.
+import src/[gui, ffmpeg_api]
 
 proc main() =
   # Полная, но НЕ избыточная диагностика: AV_LOG_INFO показывает ключевое

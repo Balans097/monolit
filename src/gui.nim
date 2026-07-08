@@ -9,8 +9,7 @@
 # ==============================================================================
 
 import std/[strformat, os, strutils]
-import gtk4_api
-import stabilizer
+import gtk4_api, stabilizer
 
 const MONOLIT_VERSION* = "1.3"
 
@@ -119,11 +118,11 @@ proc g_timeout_add_wrapper(interval: cuint; fn: GSourceFunc; data: pointer): cui
 # ------------------------------------------------------------------------------
 proc labeledRow(box: ptr GtkBox; caption: string; control: ptr GtkWidget) =
   let
-    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12.cint)
-    lbl = gtk_label_new(caption.cstring)
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
+    lbl = gtk_label_new(cstring(caption))
   gtk_label_set_xalign(cast[ptr GtkLabel](lbl), 0.0)
-  gtk_widget_set_hexpand(lbl, 0.cint)
-  gtk_widget_set_hexpand(control, 1.cint)
+  gtk_widget_set_hexpand(lbl, cint(0))
+  gtk_widget_set_hexpand(control, cint(1))
   gtk_box_append(cast[ptr GtkBox](row), lbl)
   gtk_box_append(cast[ptr GtkBox](row), control)
   gtk_box_append(box, row)
@@ -131,21 +130,21 @@ proc labeledRow(box: ptr GtkBox; caption: string; control: ptr GtkWidget) =
 proc newScaleRow(box: ptr GtkBox; caption: string;
                   min, max, step, initial: float; digits: int): ptr GtkRange =
   let scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
-                                        min.cdouble, max.cdouble, step.cdouble)
-  gtk_scale_set_digits(cast[ptr GtkScale](scale), digits.cint)
+                                        cdouble(min), cdouble(max), cdouble(step))
+  gtk_scale_set_digits(cast[ptr GtkScale](scale), cint(digits))
   # Показываем текущее числовое значение прямо на ползунке (справа от
   # него) — стандартный механизм GTK, без отдельного синхронизируемого
   # вручную GtkLabel.
-  gtk_scale_set_draw_value(cast[ptr GtkScale](scale), 1.cint)
+  gtk_scale_set_draw_value(cast[ptr GtkScale](scale), cint(1))
   gtk_scale_set_value_pos(cast[ptr GtkScale](scale), GTK_POS_RIGHT)
-  gtk_range_set_value(cast[ptr GtkRange](scale), initial.cdouble)
+  gtk_range_set_value(cast[ptr GtkRange](scale), cdouble(initial))
   labeledRow(box, caption, scale)
   result = cast[ptr GtkRange](scale)
 
 proc newDropDownRow(box: ptr GtkBox; caption: string;
                      items: openArray[string]; defaultIdx: int): ptr GtkDropDown =
   let dd = newDropDown(items)
-  gtk_drop_down_set_selected(cast[ptr GtkDropDown](dd), defaultIdx.cuint)
+  gtk_drop_down_set_selected(cast[ptr GtkDropDown](dd), cuint(defaultIdx))
   labeledRow(box, caption, dd)
   result = cast[ptr GtkDropDown](dd)
 
@@ -158,12 +157,12 @@ proc newDropDownRow(box: ptr GtkBox; caption: string;
 # ------------------------------------------------------------------------------
 proc newBoldLabel(text: string): ptr GtkWidget =
   result = gtk_label_new(nil)
-  gtk_label_set_markup(cast[ptr GtkLabel](result), ("<b>" & text & "</b>").cstring)
+  gtk_label_set_markup(cast[ptr GtkLabel](result), cstring("<b>" & text & "</b>"))
   gtk_label_set_xalign(cast[ptr GtkLabel](result), 0.0)
 
 proc newItalicLabel(text: string): ptr GtkWidget =
   result = gtk_label_new(nil)
-  gtk_label_set_markup(cast[ptr GtkLabel](result), ("<i>" & text & "</i>").cstring)
+  gtk_label_set_markup(cast[ptr GtkLabel](result), cstring("<i>" & text & "</i>"))
   gtk_label_set_xalign(cast[ptr GtkLabel](result), 0.0)
 
 proc newBoldCheckButton(caption: string): ptr GtkWidget =
@@ -177,12 +176,12 @@ proc newBoldButton(caption: string): ptr GtkWidget =
   gtk_button_set_child(cast[ptr GtkButton](result), lbl)
 
 proc newPage(tabTitle: string; notebook: ptr GtkNotebook): ptr GtkBox =
-  let page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8.cint)
-  gtk_widget_set_margin_top(page, 12.cint)
-  gtk_widget_set_margin_bottom(page, 12.cint)
-  gtk_widget_set_margin_start(page, 12.cint)
-  gtk_widget_set_margin_end(page, 12.cint)
-  discard gtk_notebook_append_page(notebook, page, gtk_label_new(tabTitle.cstring))
+  let page = gtk_box_new(GTK_ORIENTATION_VERTICAL, cint(8))
+  gtk_widget_set_margin_top(page, cint(12))
+  gtk_widget_set_margin_bottom(page, cint(12))
+  gtk_widget_set_margin_start(page, cint(12))
+  gtk_widget_set_margin_end(page, cint(12))
+  discard gtk_notebook_append_page(notebook, page, gtk_label_new(cstring(tabTitle)))
   result = cast[ptr GtkBox](page)
 
 # ------------------------------------------------------------------------------
@@ -191,7 +190,7 @@ proc newPage(tabTitle: string; notebook: ptr GtkNotebook): ptr GtkBox =
 proc selectedContainerExt(): string =
   ## Расширение (без точки), выбранное в выпадающем списке «Контейнер
   ## результата» на вкладке «Файл» — "mp4" или "mkv".
-  CONTAINER_ITEMS[gtk_drop_down_get_selected(w.container).int]
+  CONTAINER_ITEMS[int(gtk_drop_down_get_selected(w.container))]
 
 proc onOpenResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.} =
   if GtkResponseType(response) == GTK_RESPONSE_ACCEPT:
@@ -200,7 +199,7 @@ proc onOpenResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.
       let path = g_file_get_path(file)
       if path != nil:
         cfg.inputFile = $path
-        gtk_label_set_text(w.inputLabel, cfg.inputFile.cstring)
+        gtk_label_set_text(w.inputLabel, cstring(cfg.inputFile))
         if not outputExplicit:
           # По умолчанию сохраняем рядом со входным файлом, пока
           # пользователь явно не укажет другое место через «Куда
@@ -208,9 +207,9 @@ proc onOpenResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.
           # автоподстановка больше не трогает выбор (см. onSaveResponse).
           let (dir, _, _) = splitFile(cfg.inputFile)
           let ext = selectedContainerExt()
-          cfg.outputFile = (if dir.len > 0: dir / ("stabilized." & ext)
+          cfg.outputFile = (if len(dir) > 0: dir / ("stabilized." & ext)
                              else: "stabilized." & ext)
-          gtk_label_set_text(w.outputLabel, cfg.outputFile.cstring)
+          gtk_label_set_text(w.outputLabel, cstring(cfg.outputFile))
   gtk_native_dialog_destroy(dialog)
 
 proc onSaveResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.} =
@@ -227,10 +226,10 @@ proc onSaveResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.
         # libavformat (avformat_alloc_output_context2) определит мьюксер
         # по фактическому расширению файла, и оно разойдётся с тем, что
         # видел пользователь в выпадающем списке.
-        if not outPath.toLowerAscii().endsWith("." & wantExt):
+        if not endsWith(toLowerAscii(outPath), "." & wantExt):
           outPath = changeFileExt(outPath, wantExt)
         cfg.outputFile = outPath
-        gtk_label_set_text(w.outputLabel, cfg.outputFile.cstring)
+        gtk_label_set_text(w.outputLabel, cstring(cfg.outputFile))
         outputExplicit = true
   gtk_native_dialog_destroy(dialog)
 
@@ -238,20 +237,20 @@ proc onContainerChanged(dd: pointer; pspec: pointer; userData: pointer) {.cdecl.
   ## При смене контейнера сразу меняем расширение УЖЕ выбранного пути
   ## сохранения — иначе легко получить mkv-файл с именем output.mp4
   ## просто потому что забыли поправить расширение вручную.
-  if cfg.outputFile.len == 0: return
+  if len(cfg.outputFile) == 0: return
   let wantExt = selectedContainerExt()
-  if not cfg.outputFile.toLowerAscii().endsWith("." & wantExt):
+  if not endsWith(toLowerAscii(cfg.outputFile), "." & wantExt):
     cfg.outputFile = changeFileExt(cfg.outputFile, wantExt)
-    gtk_label_set_text(w.outputLabel, cfg.outputFile.cstring)
+    gtk_label_set_text(w.outputLabel, cstring(cfg.outputFile))
 
 proc onPickInput(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
   let filt = gtk_file_filter_new()
-  gtk_file_filter_set_name(filt, "Видео".cstring)
+  gtk_file_filter_set_name(filt, cstring("Видео"))
   for pat in ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"]:
-    gtk_file_filter_add_pattern(filt, pat.cstring)
+    gtk_file_filter_add_pattern(filt, cstring(pat))
   let dlg = gtk_file_chooser_native_new(
-    "Выберите исходное видео".cstring, w.window,
-    GTK_FILE_CHOOSER_ACTION_OPEN, "Открыть".cstring, "Отмена".cstring)
+    cstring("Выберите исходное видео"), w.window,
+    GTK_FILE_CHOOSER_ACTION_OPEN, cstring("Открыть"), cstring("Отмена"))
   gtk_file_chooser_add_filter(cast[pointer](dlg), filt)
   connect(cast[pointer](dlg), "response", onOpenResponse)
   gtk_native_dialog_show(cast[pointer](dlg))
@@ -259,13 +258,13 @@ proc onPickInput(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
 proc onPickOutput(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
   let ext = selectedContainerExt()
   let dlg = gtk_file_chooser_native_new(
-    "Сохранить стабилизированное видео как".cstring, w.window,
-    GTK_FILE_CHOOSER_ACTION_SAVE, "Сохранить".cstring, "Отмена".cstring)
+    cstring("Сохранить стабилизированное видео как"), w.window,
+    GTK_FILE_CHOOSER_ACTION_SAVE, cstring("Сохранить"), cstring("Отмена"))
   let filt = gtk_file_filter_new()
-  gtk_file_filter_set_name(filt, (ext & " видео").cstring)
-  gtk_file_filter_add_pattern(filt, ("*." & ext).cstring)
+  gtk_file_filter_set_name(filt, cstring(ext & " видео"))
+  gtk_file_filter_add_pattern(filt, cstring("*." & ext))
   gtk_file_chooser_add_filter(cast[pointer](dlg), filt)
-  gtk_file_chooser_set_current_name(cast[pointer](dlg), ("stabilized." & ext).cstring)
+  gtk_file_chooser_set_current_name(cast[pointer](dlg), cstring("stabilized." & ext))
   connect(cast[pointer](dlg), "response", onSaveResponse)
   gtk_native_dialog_show(cast[pointer](dlg))
 
@@ -273,22 +272,22 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
   let page = newPage("Файл", notebook)
 
   let
-    inRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12.cint)
-    inBtn = gtk_button_new_with_label("Выбрать исходное видео...".cstring)
-  w.inputLabel = cast[ptr GtkLabel](gtk_label_new(cfg.inputFile.cstring))
+    inRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
+    inBtn = gtk_button_new_with_label(cstring("Выбрать исходное видео..."))
+  w.inputLabel = cast[ptr GtkLabel](gtk_label_new(cstring(cfg.inputFile)))
   gtk_label_set_xalign(w.inputLabel, 0.0)
-  gtk_widget_set_hexpand(cast[ptr GtkWidget](w.inputLabel), 1.cint)
+  gtk_widget_set_hexpand(cast[ptr GtkWidget](w.inputLabel), cint(1))
   connect(cast[pointer](inBtn), "clicked", onPickInput)
   gtk_box_append(cast[ptr GtkBox](inRow), inBtn)
   gtk_box_append(cast[ptr GtkBox](inRow), cast[ptr GtkWidget](w.inputLabel))
   gtk_box_append(page, inRow)
 
   let
-    outRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12.cint)
-    outBtn = gtk_button_new_with_label("Куда сохранить...".cstring)
-  w.outputLabel = cast[ptr GtkLabel](gtk_label_new(cfg.outputFile.cstring))
+    outRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
+    outBtn = gtk_button_new_with_label(cstring("Куда сохранить..."))
+  w.outputLabel = cast[ptr GtkLabel](gtk_label_new(cstring(cfg.outputFile)))
   gtk_label_set_xalign(w.outputLabel, 0.0)
-  gtk_widget_set_hexpand(cast[ptr GtkWidget](w.outputLabel), 1.cint)
+  gtk_widget_set_hexpand(cast[ptr GtkWidget](w.outputLabel), cint(1))
   connect(cast[pointer](outBtn), "clicked", onPickOutput)
   gtk_box_append(cast[ptr GtkBox](outRow), outBtn)
   gtk_box_append(cast[ptr GtkBox](outRow), cast[ptr GtkWidget](w.outputLabel))
@@ -301,11 +300,11 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
     "mkv надёжнее сохраняет субтитры и вложения (шрифты); mp4 — самый\n" &
     "совместимый вариант для проигрывателей и сайтов. Расширение файла\n" &
     "в диалоге «Куда сохранить...» подставляется по этому выбору.")
-  gtk_widget_set_margin_bottom(containerNote, 6.cint)
+  gtk_widget_set_margin_bottom(containerNote, cint(6))
   gtk_box_append(page, containerNote)
 
-  let audioChk = gtk_check_button_new_with_label("Копировать звук без перекодирования".cstring)
-  gtk_check_button_set_active(cast[ptr GtkCheckButton](audioChk), 1.cint)
+  let audioChk = gtk_check_button_new_with_label(cstring("Копировать звук без перекодирования"))
+  gtk_check_button_set_active(cast[ptr GtkCheckButton](audioChk), cint(1))
   w.copyAudio = cast[ptr GtkCheckButton](audioChk)
   gtk_box_append(page, audioChk)
 
@@ -313,16 +312,16 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
   # флагом copyAudio на оба типа потоков) — теперь это два независимых
   # переключателя: можно, например, сохранить звук, но выкинуть субтитры,
   # или наоборот.
-  let subsChk = gtk_check_button_new_with_label("Сохранить субтитры".cstring)
-  gtk_check_button_set_active(cast[ptr GtkCheckButton](subsChk), 1.cint)
+  let subsChk = gtk_check_button_new_with_label(cstring("Сохранить субтитры"))
+  gtk_check_button_set_active(cast[ptr GtkCheckButton](subsChk), cint(1))
   w.saveSubtitles = cast[ptr GtkCheckButton](subsChk)
   gtk_box_append(page, subsChk)
 
   # "Вложения" контейнера — это, как правило, встроенные в mkv шрифты
   # (нужны для корректного отображения стилизованных субтитров ASS/SSA)
   # и другие произвольные файлы, которые можно прикрепить к mkv-контейнеру.
-  let attachChk = gtk_check_button_new_with_label("Сохранить вложения (шрифты и т.п.)".cstring)
-  gtk_check_button_set_active(cast[ptr GtkCheckButton](attachChk), 1.cint)
+  let attachChk = gtk_check_button_new_with_label(cstring("Сохранить вложения (шрифты и т.п.)"))
+  gtk_check_button_set_active(cast[ptr GtkCheckButton](attachChk), cint(1))
   w.saveAttachments = cast[ptr GtkCheckButton](attachChk)
   gtk_box_append(page, attachChk)
 
@@ -341,7 +340,7 @@ proc buildStabTab(notebook: ptr GtkNotebook) =
   w.mincontrast = newScaleRow(page, "Мин. контраст (mincontrast)",    0.0, 1.0, 0.05, 0.3, 2)
 
   let hdr2 = newBoldLabel("Проход 2 — компенсация (vidstabtransform)")
-  gtk_widget_set_margin_top(hdr2, 12.cint)
+  gtk_widget_set_margin_top(hdr2, cint(12))
   gtk_box_append(page, hdr2)
 
   w.smoothing = newScaleRow(page, "Сглаживание (кадров)", 0, 200, 1, 30, 0)
@@ -359,7 +358,7 @@ proc buildStabTab(notebook: ptr GtkNotebook) =
   let note = newItalicLabel(
     "«Чёрные поля» = crop=black; вариант «keep» дотягивает картинку\n" &
     "с предыдущего кадра вместо чёрной рамки.")
-  gtk_widget_set_margin_top(note, 6.cint)
+  gtk_widget_set_margin_top(note, cint(6))
   gtk_box_append(page, note)
 
 # ------------------------------------------------------------------------------
@@ -373,9 +372,9 @@ proc buildStabTab(notebook: ptr GtkNotebook) =
 proc onFilterToggled(cb: ptr GtkCheckButton; userData: pointer) {.cdecl.} =
   if gtk_check_button_get_active(cb) == 0:
     return
-  if cb != w.smartblurEnabled: gtk_check_button_set_active(w.smartblurEnabled, 0.cint)
-  if cb != w.sharpenEnabled:   gtk_check_button_set_active(w.sharpenEnabled, 0.cint)
-  if cb != w.casEnabled:       gtk_check_button_set_active(w.casEnabled, 0.cint)
+  if cb != w.smartblurEnabled: gtk_check_button_set_active(w.smartblurEnabled, cint(0))
+  if cb != w.sharpenEnabled:   gtk_check_button_set_active(w.sharpenEnabled, cint(0))
+  if cb != w.casEnabled:       gtk_check_button_set_active(w.casEnabled, cint(0))
 
 proc buildSharpenTab(notebook: ptr GtkNotebook) =
   let page = newPage("Резкость", notebook)
@@ -393,8 +392,8 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
   let sbNote = newItalicLabel(
     "Smart Blur ставится ПЕРЕД фильтрами резкости ниже: резкость усиливает\n" &
     "уже имеющийся шум, поэтому шумоподавление имеет смысл делать раньше.")
-  gtk_widget_set_margin_top(sbNote, 6.cint)
-  gtk_widget_set_margin_bottom(sbNote, 6.cint)
+  gtk_widget_set_margin_top(sbNote, cint(6))
+  gtk_widget_set_margin_bottom(sbNote, cint(6))
   gtk_box_append(page, sbNote)
 
   # --- unsharp: классическая резкость ----------------------------------------
@@ -407,13 +406,13 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
   # --- cas: Contrast Adaptive Sharpening -------------------------------------
   let casChk = newBoldCheckButton("Применить Contrast Adaptive Sharpening (cas)")
   w.casEnabled = cast[ptr GtkCheckButton](casChk)
-  gtk_widget_set_margin_top(casChk, 6.cint)
+  gtk_widget_set_margin_top(casChk, cint(6))
   # По умолчанию включаем именно cas: из трёх фильтров резкости он меньше
   # всего «звенит» на контрастных краях (см. заметку ниже), поэтому это
   # наиболее безопасный/качественный выбор "из коробки". Устанавливаем
   # активным ДО connect(...) ниже, чтобы не спровоцировать одноразовый
   # холостой вызов onFilterToggled при старте.
-  gtk_check_button_set_active(cast[ptr GtkCheckButton](casChk), 1.cint)
+  gtk_check_button_set_active(cast[ptr GtkCheckButton](casChk), cint(1))
   gtk_box_append(page, casChk)
 
   w.casStrength = newScaleRow(page, "Сила (strength)", 0.0, 1.0, 0.05, 0.7, 2)
@@ -432,7 +431,7 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
     "усиливаются артефакты исходной тряски вместо деталей кадра. Включить\n" &
     "можно только один из трёх фильтров — cas меньше «звенит» на\n" &
     "контрастных краях, чем классический unsharp.")
-  gtk_widget_set_margin_top(note, 6.cint)
+  gtk_widget_set_margin_top(note, cint(6))
   gtk_box_append(page, note)
 
 # ------------------------------------------------------------------------------
@@ -445,9 +444,9 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
 # т.к. реально применяется только один из них (см. stabilizer.buildTransformFilterDesc/
 # runTransformPass, где выбор идёт по cfg.encodeMode).
 proc onEncodeModeChanged(dd: pointer; pspec: pointer; userData: pointer) {.cdecl.} =
-  let isTwoPass = gtk_drop_down_get_selected(cast[ptr GtkDropDown](dd)) == 1.cuint
-  gtk_widget_set_sensitive(cast[ptr GtkWidget](w.crf), (not isTwoPass).cint)
-  gtk_widget_set_sensitive(cast[ptr GtkWidget](w.videoBitrate), isTwoPass.cint)
+  let isTwoPass = gtk_drop_down_get_selected(cast[ptr GtkDropDown](dd)) == cuint(1)
+  gtk_widget_set_sensitive(cast[ptr GtkWidget](w.crf), cint(not isTwoPass))
+  gtk_widget_set_sensitive(cast[ptr GtkWidget](w.videoBitrate), cint(isTwoPass))
 
 proc buildCompressionTab(notebook: ptr GtkNotebook) =
   let page = newPage("Компрессия", notebook)
@@ -464,7 +463,7 @@ proc buildCompressionTab(notebook: ptr GtkNotebook) =
   # По умолчанию выбран режим "1 проход (CRF)" — битрейт в нём не участвует
   # в кодировании вообще, поэтому сразу блокируем ползунок, чтобы не вводить
   # в заблуждение (актуальное состояние поддерживается onEncodeModeChanged).
-  gtk_widget_set_sensitive(cast[ptr GtkWidget](w.videoBitrate), 0.cint)
+  gtk_widget_set_sensitive(cast[ptr GtkWidget](w.videoBitrate), cint(0))
 
   # Курсив + два отдельных виджета вместо одного текстового блока: между
   # предложениями нужен явный вертикальный отступ, а не просто перенос
@@ -474,7 +473,7 @@ proc buildCompressionTab(notebook: ptr GtkNotebook) =
     "«1 проход (CRF)» — постоянное качество на всём ролике; быстрее, но\n" &
     "итоговый размер файла заранее не предсказать. Для «наивысшего\n" &
     "качества» — preset=slow/slower и CRF 16-18.")
-  gtk_widget_set_margin_top(noteCRF, 6.cint)
+  gtk_widget_set_margin_top(noteCRF, cint(6))
   gtk_box_append(page, noteCRF)
 
   let note2Pass = newItalicLabel(
@@ -482,7 +481,7 @@ proc buildCompressionTab(notebook: ptr GtkNotebook) =
     "статистику сложности сцен, затем кодирует повторно, распределяя биты\n" &
     "так, чтобы точно попасть в заданный битрейт/размер файла — вдвое\n" &
     "медленнее, зато предсказуемый результат.")
-  gtk_widget_set_margin_top(note2Pass, 10.cint)   # вертикальный пробел между абзацами
+  gtk_widget_set_margin_top(note2Pass, cint(10))   # вертикальный пробел между абзацами
   gtk_box_append(page, note2Pass)
 
 # ------------------------------------------------------------------------------
@@ -493,31 +492,31 @@ proc collectConfig(): StabConfig =
   result.shakiness   = int(gtk_range_get_value(w.shakiness))
   result.accuracy    = int(gtk_range_get_value(w.accuracy))
   result.stepsize    = int(gtk_range_get_value(w.stepsize))
-  result.mincontrast = gtk_range_get_value(w.mincontrast).float
+  result.mincontrast = float(gtk_range_get_value(w.mincontrast))
 
   result.smoothing = int(gtk_range_get_value(w.smoothing))
-  result.zoom      = gtk_range_get_value(w.zoom).float
+  result.zoom      = float(gtk_range_get_value(w.zoom))
   result.optzoom   = int(gtk_drop_down_get_selected(w.optzoom))
-  result.crop      = CropMode(gtk_drop_down_get_selected(w.crop).int)
-  result.interpol  = InterpolMode(gtk_drop_down_get_selected(w.interpol).int)
+  result.crop      = CropMode(int(gtk_drop_down_get_selected(w.crop)))
+  result.interpol  = InterpolMode(int(gtk_drop_down_get_selected(w.interpol)))
   result.maxShift  = int(gtk_range_get_value(w.maxShift))
-  result.maxAngle  = gtk_range_get_value(w.maxAngle).float
+  result.maxAngle  = float(gtk_range_get_value(w.maxAngle))
 
   result.sharpenEnabled = gtk_check_button_get_active(w.sharpenEnabled) != 0
-  result.sharpenAmount  = gtk_range_get_value(w.sharpenAmount).float
+  result.sharpenAmount  = float(gtk_range_get_value(w.sharpenAmount))
 
   result.smartblurEnabled   = gtk_check_button_get_active(w.smartblurEnabled) != 0
-  result.smartblurRadius    = gtk_range_get_value(w.smartblurRadius).float
-  result.smartblurStrength  = gtk_range_get_value(w.smartblurStrength).float
-  result.smartblurThreshold = gtk_range_get_value(w.smartblurThreshold).float
+  result.smartblurRadius    = float(gtk_range_get_value(w.smartblurRadius))
+  result.smartblurStrength  = float(gtk_range_get_value(w.smartblurStrength))
+  result.smartblurThreshold = float(gtk_range_get_value(w.smartblurThreshold))
 
   result.casEnabled  = gtk_check_button_get_active(w.casEnabled) != 0
-  result.casStrength = gtk_range_get_value(w.casStrength).float
+  result.casStrength = float(gtk_range_get_value(w.casStrength))
 
-  result.preset     = PRESET_ITEMS[gtk_drop_down_get_selected(w.preset).int]
+  result.preset     = PRESET_ITEMS[int(gtk_drop_down_get_selected(w.preset))]
   # Индекс 0 = "1 проход (CRF)" = emCRF, индекс 1 = "2 прохода" = emBitrate2Pass
   # (см. ENCODE_MODE_ITEMS выше — порядок жёстко согласован с EncodeMode).
-  result.encodeMode = if gtk_drop_down_get_selected(w.encodeMode) == 0.cuint:
+  result.encodeMode = if gtk_drop_down_get_selected(w.encodeMode) == cuint(0):
                          emCRF
                        else:
                          emBitrate2Pass
@@ -539,53 +538,53 @@ proc onProgressTick(userData: pointer): cint {.cdecl.} =
 
   case phase
   of phaseAnalyze:
-    let frac = if total > 0: min(1.0, done.float / total.float) else: 0.0
-    gtk_progress_bar_set_fraction(w.progressBar, frac.cdouble)
+    let frac = if total > 0: min(1.0, float(done) / float(total)) else: 0.0
+    gtk_progress_bar_set_fraction(w.progressBar, cdouble(frac))
     gtk_label_set_text(w.statusLabel,
-      fmt"Проход 1/2 — анализ движения: {done}/{total} кадров".cstring)
-    return 1.cint   # G_SOURCE_CONTINUE — таймер продолжает тикать
+      cstring(fmt"Проход 1/2 — анализ движения: {done}/{total} кадров"))
+    return cint(1)   # G_SOURCE_CONTINUE — таймер продолжает тикать
 
   of phaseEncodePass1:
-    let frac = if total > 0: min(1.0, done.float / total.float) else: 0.0
-    gtk_progress_bar_set_fraction(w.progressBar, frac.cdouble)
+    let frac = if total > 0: min(1.0, float(done) / float(total)) else: 0.0
+    gtk_progress_bar_set_fraction(w.progressBar, cdouble(frac))
     gtk_label_set_text(w.statusLabel,
-      fmt"Кодирование, проход A/2 — сбор статистики битрейта: {done}/{total} кадров".cstring)
-    return 1.cint
+      cstring(fmt"Кодирование, проход A/2 — сбор статистики битрейта: {done}/{total} кадров"))
+    return cint(1)
 
   of phaseTransform:
-    let frac = if total > 0: min(1.0, done.float / total.float) else: 0.0
-    gtk_progress_bar_set_fraction(w.progressBar, frac.cdouble)
+    let frac = if total > 0: min(1.0, float(done) / float(total)) else: 0.0
+    gtk_progress_bar_set_fraction(w.progressBar, cdouble(frac))
     gtk_label_set_text(w.statusLabel,
-      fmt"Проход 2/2 — стабилизация и кодирование: {done}/{total} кадров".cstring)
-    return 1.cint
+      cstring(fmt"Проход 2/2 — стабилизация и кодирование: {done}/{total} кадров"))
+    return cint(1)
 
   of phaseDone:
     gtk_progress_bar_set_fraction(w.progressBar, 1.0)
-    gtk_label_set_text(w.statusLabel, "Готово.".cstring)
+    gtk_label_set_text(w.statusLabel, cstring("Готово."))
     jobRunning = false
-    gtk_label_set_text(w.startButtonLabel, "Старт".cstring)
-    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), 1.cint)
+    gtk_label_set_text(w.startButtonLabel, cstring("Старт"))
+    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
     return G_SOURCE_REMOVE
 
   of phaseError:
-    gtk_label_set_text(w.statusLabel, fmt"Ошибка: {errMsg}".cstring)
+    gtk_label_set_text(w.statusLabel, cstring(fmt"Ошибка: {errMsg}"))
     jobRunning = false
-    gtk_label_set_text(w.startButtonLabel, "Старт".cstring)
-    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), 1.cint)
+    gtk_label_set_text(w.startButtonLabel, cstring("Старт"))
+    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
     return G_SOURCE_REMOVE
 
   of phaseCancelled:
-    gtk_label_set_text(w.statusLabel, "Остановлено пользователем.".cstring)
+    gtk_label_set_text(w.statusLabel, cstring("Остановлено пользователем."))
     jobRunning = false
-    gtk_label_set_text(w.startButtonLabel, "Старт".cstring)
-    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), 1.cint)
+    gtk_label_set_text(w.startButtonLabel, cstring("Старт"))
+    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
     return G_SOURCE_REMOVE
 
   else:
-    return 1.cint
+    return cint(1)
 
 proc onStartStopClicked(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
   if jobRunning:
@@ -595,30 +594,48 @@ proc onStartStopClicked(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
     # заметит phaseCancelled и вернёт кнопку в состояние «Старт». Пока
     # поток не подтвердил остановку, блокируем кнопку от повторных кликов.
     requestCancel()
-    gtk_label_set_text(w.statusLabel, "Останавливаем...".cstring)
-    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), 0.cint)
+    gtk_label_set_text(w.statusLabel, cstring("Останавливаем..."))
+    gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(0))
     return
 
-  if cfg.inputFile.len == 0 or not fileExists(cfg.inputFile):
-    gtk_label_set_text(w.statusLabel, "Сначала выберите исходный файл.".cstring)
+  if len(cfg.inputFile) == 0 or not fileExists(cfg.inputFile):
+    gtk_label_set_text(w.statusLabel, cstring("Сначала выберите исходный файл."))
     return
-  if cfg.outputFile.len == 0:
-    gtk_label_set_text(w.statusLabel, "Укажите, куда сохранить результат.".cstring)
+  if len(cfg.outputFile) == 0:
+    gtk_label_set_text(w.statusLabel, cstring("Укажите, куда сохранить результат."))
     return
 
   let jobCfg = collectConfig()
   cfg = jobCfg
 
   jobRunning = true
-  gtk_label_set_text(w.startButtonLabel, "Стоп".cstring)
+  gtk_label_set_text(w.startButtonLabel, cstring("Стоп"))
   gtk_progress_bar_set_fraction(w.progressBar, 0.0)
-  gtk_label_set_text(w.statusLabel, "Запуск...".cstring)
+  gtk_label_set_text(w.statusLabel, cstring("Запуск..."))
 
   initStabProgress()
   createThread(procThread, processingThreadProc, jobCfg)
   # Опрос каждые 200мс — то же значение, что использует прогресс-бар PMI
   # для неблокирующей перерисовки терминального прогресса.
-  timeoutId = g_timeout_add_wrapper(200.cuint, onProgressTick, nil)
+  timeoutId = g_timeout_add_wrapper(cuint(200), onProgressTick, nil)
+
+proc onCloseRequest(window: pointer; userData: pointer): cint {.cdecl.} =
+  ## GTK4 вызывает это ПЕРЕД реальным закрытием окна. Без этого обработчика
+  ## закрытие окна во время работы фонового потока (см. processingThreadProc)
+  ## ничего не останавливает: g_application_run() в runApp() просто
+  ## вернётся, и выполнение дойдёт до конца main() ещё до того, как поток
+  ## аккуратно домучит avio_closep/av_write_trailer — итоговый файл рискует
+  ## остаться недописанным и физически повреждённым, а сам поток продолжит
+  ## висеть до принудительного завершения процесса ОС. Поэтому здесь мы,
+  ## как и по кнопке «Стоп», просим поток остановиться и СИНХРОННО ждём его
+  ## завершения (см. finally-блок runStabilization в stabilizer.nim — он
+  ## сам уже подчищает недописанный outputFile при отмене), и только потом
+  ## разрешаем закрытие — ценой краткой паузы интерфейса.
+  if jobRunning:
+    requestCancel()
+    joinThread(procThread)
+    jobRunning = false
+  return cint(0)  # FALSE (GDK_EVENT_PROPAGATE) — разрешить закрытие окна
 
 # ------------------------------------------------------------------------------
 # Сборка главного окна
@@ -641,17 +658,17 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
 
   let window = gtk_application_window_new(app)
   w.window = cast[ptr GtkWindow](window)
-  gtk_window_set_title(w.window, fmt"Monolit v{MONOLIT_VERSION} — стабилизация видео".cstring)
-  gtk_window_set_default_size(w.window, 620.cint, 560.cint)
+  gtk_window_set_title(w.window, cstring(fmt"Monolit v{MONOLIT_VERSION} — стабилизация видео"))
+  gtk_window_set_default_size(w.window, cint(620), cint(560))
 
-  let root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8.cint)
-  gtk_widget_set_margin_top(root, 8.cint)
-  gtk_widget_set_margin_bottom(root, 8.cint)
-  gtk_widget_set_margin_start(root, 8.cint)
-  gtk_widget_set_margin_end(root, 8.cint)
+  let root = gtk_box_new(GTK_ORIENTATION_VERTICAL, cint(8))
+  gtk_widget_set_margin_top(root, cint(8))
+  gtk_widget_set_margin_bottom(root, cint(8))
+  gtk_widget_set_margin_start(root, cint(8))
+  gtk_widget_set_margin_end(root, cint(8))
 
   let notebook = cast[ptr GtkNotebook](gtk_notebook_new())
-  gtk_widget_set_hexpand(cast[ptr GtkWidget](notebook), 1.cint)
+  gtk_widget_set_hexpand(cast[ptr GtkWidget](notebook), cint(1))
   gtk_box_append(cast[ptr GtkBox](root), cast[ptr GtkWidget](notebook))
 
   buildFileTab(notebook)
@@ -660,7 +677,7 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
   buildCompressionTab(notebook)
 
   let
-    controlRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12.cint)
+    controlRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
     startStopLabel = newBoldLabel("Старт")
     startBtn = gtk_button_new()
   gtk_button_set_child(cast[ptr GtkButton](startBtn), startStopLabel)
@@ -669,20 +686,21 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
   connect(cast[pointer](startBtn), "clicked", onStartStopClicked)
 
   let pbar = gtk_progress_bar_new()
-  gtk_progress_bar_set_show_text(cast[ptr GtkProgressBar](pbar), 1.cint)
-  gtk_widget_set_hexpand(pbar, 1.cint)
+  gtk_progress_bar_set_show_text(cast[ptr GtkProgressBar](pbar), cint(1))
+  gtk_widget_set_hexpand(pbar, cint(1))
   w.progressBar = cast[ptr GtkProgressBar](pbar)
 
   gtk_box_append(cast[ptr GtkBox](controlRow), startBtn)
   gtk_box_append(cast[ptr GtkBox](controlRow), pbar)
   gtk_box_append(cast[ptr GtkBox](root), controlRow)
 
-  let status = gtk_label_new("Готово к запуску.".cstring)
+  let status = gtk_label_new(cstring("Готово к запуску."))
   gtk_label_set_xalign(cast[ptr GtkLabel](status), 0.0)
   w.statusLabel = cast[ptr GtkLabel](status)
   gtk_box_append(cast[ptr GtkBox](root), status)
 
   gtk_window_set_child(w.window, root)
+  connect(cast[pointer](w.window), "close-request", onCloseRequest)
   gtk_window_present(w.window)
 
 # ------------------------------------------------------------------------------
@@ -691,7 +709,7 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
 proc runApp*(): int =
   ## Создаёт GtkApplication, строит окно по сигналу "activate" и крутит
   ## главный цикл до закрытия окна. Возвращает код завершения приложения.
-  let app = gtk_application_new("org.monolit.app".cstring, G_APPLICATION_DEFAULT_FLAGS)
+  let app = gtk_application_new(cstring("org.monolit.app"), G_APPLICATION_DEFAULT_FLAGS)
   connect(cast[pointer](app), "activate", onActivate)
-  result = g_application_run(cast[ptr GApplication](app), 0.cint, nil).int
+  result = int(g_application_run(cast[ptr GApplication](app), cint(0), nil))
   g_object_unref(cast[pointer](app))

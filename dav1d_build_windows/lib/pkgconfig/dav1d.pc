@@ -1,0 +1,9 @@
+prefix=/home/admin/Work/Nim/Projects/VideoStabilization/Monolit/dav1d_build_windows
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: libdav1d
+Description: AV1 decoding library
+Version: 1.4.3
+Libs: -L${libdir} -ldav1d
+Cflags: -I${includedir}

@@ -24,14 +24,39 @@
 #  к тяжёлой медиа-части, а не к системному GUI-тулкиту.
 # ==============================================================================
 
-{.passC: gorge("pkg-config --cflags gtk4").}
-when not defined(windows):
-  {.passL: gorge("pkg-config --libs gtk4").}
-else:
-  # На кросс-сборке под mingw pkg-config должен быть настроен на mingw64
-  # sysroot (PKG_CONFIG_PATH/PKG_CONFIG_LIBDIR из config.nims) — тогда
-  # gorge() ниже вернёт те же -lgtk-4 -lgdk-4 ... но собранные mingw-гцц.
-  {.passL: gorge("pkg-config --libs gtk4").}
+proc pkgConfigFlags(args: string): string =
+  ## Обёртка над `pkg-config` для passC/passL ниже: в отличие от голого
+  ## gorge("pkg-config ..."), здесь ПРОВЕРЯЕТСЯ код возврата. Раньше при
+  ## неудачном поиске (например, PKG_CONFIG_LIBDIR не видел gtk4.pc для
+  ## mingw-таргета) pkg-config печатал в stdout многострочную ошибку вида
+  ## `Package gtk4 was not found in the pkg-config search path...` — и
+  ## этот текст (включая обратные кавычки) молча уходил в gorge() как
+  ## якобы валидные флаги компилятора/линковщика, а gcc затем пытался
+  ## воспринять слова "Package"/"was"/"not"/"found" как имена файлов для
+  ## линковки. Явная проверка exitCode превращает это в понятную ошибку
+  ## компиляции вместо мешанины gcc-предупреждений.
+  ##
+  ## ВАЖНО: здесь нельзя использовать quit() для остановки сборки — в
+  ## отличие от config.nims (NimScript, интерпретируется как скрипт, где
+  ## quit() штатно прерывает именно его выполнение), этот файл — обычный
+  ## .nim модуль, и вызов этой процедуры внутри passC/passL вычисляется
+  ## через CTFE (constant folding компилятора), где quit() не гарантирует
+  ## чистую остановку компиляции. Правильный способ — довести до
+  ## doAssert/raise: непойманное исключение при CTFE компилятор Nim сам
+  ## превращает в аккуратную ошибку компиляции с этим же текстом.
+  let r = gorgeEx("pkg-config " & args & " gtk4")
+  doAssert(r.exitCode == 0,
+    "`pkg-config " & args & " gtk4` завершился с ошибкой:\n" & r.output &
+    "\nПроверьте, что gtk4 (или его mingw64-сборка при кросс-компиляции " &
+    "под Windows) действительно виден через pkg-config — см. README.md, " &
+    "«Почему GTK4 не статический».")
+  result = r.output
+
+const gtk4CFlags = pkgConfigFlags("--cflags")
+const gtk4LFlags = pkgConfigFlags("--libs")
+
+{.passC: gtk4CFlags.}
+{.passL: gtk4LFlags.}
 
 # ------------------------------------------------------------------------------
 # Базовые типы GLib/GObject — opaque-указатели, как AVFormatContext в PMI
@@ -92,7 +117,7 @@ const
   GTK_RESPONSE_ACCEPT* = GtkResponseType(-3)
   GTK_RESPONSE_CANCEL* = GtkResponseType(-6)
 
-  G_APPLICATION_DEFAULT_FLAGS* = 0.cint
+  G_APPLICATION_DEFAULT_FLAGS* = cint(0)
 
 # ------------------------------------------------------------------------------
 # GApplication / GtkApplication — точка входа приложения
@@ -116,8 +141,8 @@ template connect*(instance: pointer; signal: string; handler: untyped; data: poi
   ## типизированный `proc {.cdecl.}` (например, onActivate), а не сырой
   ## pointer — cast[pointer] здесь единственное место, где нужен явный
   ## переход от Nim-типа функции к C GCallback.
-  discard g_signal_connect_data(instance, signal.cstring,
-                                 cast[pointer](handler), data, nil, 0.cint)
+  discard g_signal_connect_data(instance, cstring(signal),
+                                 cast[pointer](handler), data, nil, cint(0))
 
 # ------------------------------------------------------------------------------
 # Окно / контейнеры
@@ -304,21 +329,21 @@ proc g_object_bind_property*(source: pointer; source_property: cstring;
   {.importc: "g_object_bind_property", header: "<glib-object.h>".}
 proc g_binding_unbind*(binding: pointer)
   {.importc: "g_binding_unbind", header: "<glib-object.h>".}
-const G_BINDING_SYNC_CREATE = 2.cint  # применить текущее значение сразу при создании привязки
+const G_BINDING_SYNC_CREATE = cint(2)  # применить текущее значение сразу при создании привязки
 
 proc onDropdownItemSetup(factory: pointer; listItem: pointer; userData: pointer) {.cdecl.} =
   ## "setup" вызывается один раз на строку popup-списка: создаём
   ## горизонтальный бокс [галочка-иконка, подпись] и запоминаем оба
   ## дочерних виджета на самом list item, чтобы достать их в "bind".
-  let box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6.cint)
-  let check = gtk_image_new_from_icon_name("object-select-symbolic".cstring)
-  gtk_widget_set_visible(check, 0.cint)
+  let box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(6))
+  let check = gtk_image_new_from_icon_name(cstring("object-select-symbolic"))
+  gtk_widget_set_visible(check, cint(0))
   let label = gtk_label_new(nil)
   gtk_box_append(cast[ptr GtkBox](box), check)
   gtk_box_append(cast[ptr GtkBox](box), label)
   gtk_list_item_set_child(listItem, box)
-  g_object_set_data(listItem, "monolit-check".cstring, cast[pointer](check))
-  g_object_set_data(listItem, "monolit-label".cstring, cast[pointer](label))
+  g_object_set_data(listItem, cstring("monolit-check"), cast[pointer](check))
+  g_object_set_data(listItem, cstring("monolit-label"), cast[pointer](label))
 
 proc onDropdownItemBind(factory: pointer; listItem: pointer; userData: pointer) {.cdecl.} =
   ## "bind" вызывается при показе конкретного пункта — но для короткого
@@ -332,17 +357,17 @@ proc onDropdownItemBind(factory: pointer; listItem: pointer; userData: pointer) 
   ## g_object_bind_property: она сама реагирует на изменение selected в
   ## любой момент, без повторного bind. Старую привязку (если bind всё
   ## же вызвался повторно) снимаем, чтобы не плодить дубликаты.
-  let check = cast[ptr GtkWidget](g_object_get_data(listItem, "monolit-check".cstring))
-  let label = cast[ptr GtkLabel](g_object_get_data(listItem, "monolit-label".cstring))
+  let check = cast[ptr GtkWidget](g_object_get_data(listItem, cstring("monolit-check")))
+  let label = cast[ptr GtkLabel](g_object_get_data(listItem, cstring("monolit-label")))
   let text = gtk_string_object_get_string(gtk_list_item_get_item(listItem))
   gtk_label_set_text(label, text)
-  let oldBinding = g_object_get_data(listItem, "monolit-binding".cstring)
+  let oldBinding = g_object_get_data(listItem, cstring("monolit-binding"))
   if oldBinding != nil:
     g_binding_unbind(oldBinding)
-  let binding = g_object_bind_property(listItem, "selected".cstring,
-                                       cast[pointer](check), "visible".cstring,
+  let binding = g_object_bind_property(listItem, cstring("selected"),
+                                       cast[pointer](check), cstring("visible"),
                                        G_BINDING_SYNC_CREATE)
-  g_object_set_data(listItem, "monolit-binding".cstring, binding)
+  g_object_set_data(listItem, cstring("monolit-binding"), binding)
 
 proc newDropDown*(items: openArray[string]): ptr GtkWidget =
   ## Хелпер: строит GtkDropDown из seq[string] — прячет возню с
@@ -353,7 +378,7 @@ proc newDropDown*(items: openArray[string]): ptr GtkWidget =
   ## строка модели (и то, что вернёт gtk_string_object_get_string) не
   ## содержит никакой галочки, это только визуальная надстройка.
   var cstrs = newSeq[cstring](len(items) + 1)
-  for i, s in items: cstrs[i] = s.cstring
+  for i, s in items: cstrs[i] = cstring(s)
   cstrs[len(items)] = nil
   let model = gtk_string_list_new(addr cstrs[0])
   result = gtk_drop_down_new(cast[pointer](model), nil)
@@ -417,7 +442,7 @@ type GSourceFunc* = proc(data: pointer): cint {.cdecl.}
 proc g_idle_add*(function: GSourceFunc; data: pointer): cuint
   {.importc: "g_idle_add", header: "<glib.h>".}
 
-const G_SOURCE_REMOVE* = 0.cint  # возврат из GSourceFunc: не вызывать повторно
+const G_SOURCE_REMOVE* = cint(0)  # возврат из GSourceFunc: не вызывать повторно
 
 # ------------------------------------------------------------------------------
 # locale.h — принудительный возврат LC_NUMERIC в "C" после инициализации GTK

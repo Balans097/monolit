@@ -48,8 +48,13 @@ type
     interpBicubic = "bicubic"
 
   CropMode* = enum
-    cropKeep = "keep"     # оставить чёрные поля по краям кадра
-    cropBlack = "black"   # алиас cropKeep — используется в GUI как "чёрные поля"
+    # "keep" — вместо чёрной рамки по краю vidstabtransform дотягивает
+    # (staleness/дублирует) картинку с предыдущего кадра, поэтому рамка
+    # не чёрная, а "смазанная" продолжением предыдущего кадра.
+    cropKeep = "keep"
+    # "black" — реальные чёрные поля по краям кадра там, где после
+    # компенсации тряски не хватает исходного изображения.
+    cropBlack = "black"
 
   EncodeMode* = enum
     ## Режим управления битрейтом энкодера libx264 (вкладка «Компрессия»).
@@ -74,7 +79,7 @@ type
     smoothing*:    int         # окно сглаживания траектории (кадров)
     zoom*:         float       # базовый зум, %; 0 = без принудительного зума
     optzoom*:      int         # 0=выкл,1=статичный оптимальный,2=адаптивный
-    crop*:         CropMode    # keep(=black) — чёрные поля; иначе кроп по краю
+    crop*:         CropMode    # keep=дотянуть с предыдущего кадра; black=чёрные поля
     interpol*:     InterpolMode
     maxShift*:     int         # -1 = без ограничения (px)
     maxAngle*:     float       # -1 = без ограничения (радианы)
@@ -225,7 +230,7 @@ proc isCancelRequested(): bool {.inline, gcsafe.} =
 # Общие мелочи для обоих проходов
 # ------------------------------------------------------------------------------
 proc transformFilePath(cfg: StabConfig): string =
-  let dir = if cfg.tempDir.len > 0: cfg.tempDir else: getTempDir()
+  let dir = if len(cfg.tempDir) > 0: cfg.tempDir else: getTempDir()
   dir / "monolit_transforms.trf"
 
 {.emit: """
@@ -288,8 +293,8 @@ proc openDecoderFor(fmtCtx: ptr AVFormatContext; streamIdx: cint;
     raise newException(IOError, "avcodec_alloc_context3 (decoder) failed")
   ffCheck(avcodec_parameters_to_context(result, stream.codecpar),
           "parameters_to_context")
-  result.thread_count = threads.cint
-  result.thread_type  = (FF_THREAD_FRAME or FF_THREAD_SLICE).cint
+  result.thread_count = cint(threads)
+  result.thread_type  = cint(FF_THREAD_FRAME or FF_THREAD_SLICE)
   {.emit: "`result`->get_format = monolit_sw_only_get_format;".}
   ffCheck(avcodec_open2(result, codec, nil), "avcodec_open2 decoder")
 
@@ -300,8 +305,8 @@ proc estimateFrameCount(fmtCtx: ptr AVFormatContext; vidIdx: cint): int64 =
   let
     fps = getStreamFps(stream)
     dur =
-      if fmtCtx.duration > 0: fmtCtx.duration.float / AV_TIME_BASE.float
-      elif stream.duration > 0: stream.duration.float * av_q2d(stream.time_base)
+      if fmtCtx.duration > 0: float(fmtCtx.duration) / float(AV_TIME_BASE)
+      elif stream.duration > 0: float(stream.duration) * av_q2d(stream.time_base)
       else: 0.0
   result = max(1'i64, int64(dur * fps))
 
@@ -310,20 +315,20 @@ proc estimateFrameCount(fmtCtx: ptr AVFormatContext; vidIdx: cint): int64 =
 # ------------------------------------------------------------------------------
 proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
   var fmtCtx: ptr AVFormatContext
-  ffCheck(avformat_open_input(addr fmtCtx, cfg.inputFile.cstring, nil, nil),
+  ffCheck(avformat_open_input(addr fmtCtx, cstring(cfg.inputFile), nil, nil),
           "открытие: " & cfg.inputFile)
   defer: avformat_close_input(addr fmtCtx)
   ffCheck(avformat_find_stream_info(fmtCtx, nil), "find_stream_info")
 
   var decoder: ptr AVCodec
   let vidIdx = av_find_best_stream(
-    fmtCtx, AVMEDIA_TYPE_VIDEO, -1.cint, -1.cint, cast[pointer](addr decoder), 0.cint)
+    fmtCtx, AVMEDIA_TYPE_VIDEO, cint(-1), cint(-1), cast[pointer](addr decoder), cint(0))
   if vidIdx < 0:
     raise newException(IOError, "видеопоток не найден: " & cfg.inputFile)
 
-  setPhase(phaseAnalyze, estimateFrameCount(fmtCtx, vidIdx.cint))
+  setPhase(phaseAnalyze, estimateFrameCount(fmtCtx, cint(vidIdx)))
 
-  var decCtx = openDecoderFor(fmtCtx, vidIdx.cint, threads)
+  var decCtx = openDecoderFor(fmtCtx, cint(vidIdx), threads)
   defer: avcodec_free_context(addr decCtx)
 
   let stream = fmtCtx.streams[vidIdx]
@@ -346,13 +351,13 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
     tb = stream.time_base
     fr = getStreamFpsRat(stream)
     srcArgs = fmt"video_size={decCtx.width}x{decCtx.height}" &
-              fmt":pix_fmt={decCtx.pix_fmt.cint}" &
+              fmt":pix_fmt={cint(decCtx.pix_fmt)}" &
               fmt":time_base={tb.num}/{tb.den}" &
               fmt":pixel_aspect=1/1:frame_rate={fr.num}/{fr.den}"
 
   var srcCtx, sinkCtx: ptr AVFilterContext
   ffCheck(avfilter_graph_create_filter(addr srcCtx, bufFilt, "in",
-          srcArgs.cstring, nil, graph), "buffersrc create")
+          cstring(srcArgs), nil, graph), "buffersrc create")
   ffCheck(avfilter_graph_create_filter(addr sinkCtx, sinkFilt, "out",
           nil, nil, graph), "buffersink create")
 
@@ -363,7 +368,7 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
   let filterDesc = fmt"vidstabdetect=result={trfPath}" &
                    fmt":shakiness={cfg.shakiness}:accuracy={cfg.accuracy}" &
                    fmt":stepsize={cfg.stepsize}:mincontrast={cfg.mincontrast:.3f}"
-  stderr.writeLine("[Monolit] Проход 1 (vidstabdetect): " & filterDesc)
+  writeLine(stderr, "[Monolit] Проход 1 (vidstabdetect): " & filterDesc)
   flushFile(stderr)
 
   var
@@ -371,7 +376,7 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
     outputs = avfilter_inout_alloc()
   outputs.name = av_strdup("in");  outputs.filter_ctx = srcCtx;  outputs.pad_idx = 0; outputs.next = nil
   inputs.name  = av_strdup("out"); inputs.filter_ctx  = sinkCtx; inputs.pad_idx  = 0; inputs.next  = nil
-  let pr = avfilter_graph_parse_ptr(graph, filterDesc.cstring, addr inputs, addr outputs, nil)
+  let pr = avfilter_graph_parse_ptr(graph, cstring(filterDesc), addr inputs, addr outputs, nil)
   avfilter_inout_free(addr inputs)
   avfilter_inout_free(addr outputs)
   if pr < 0:
@@ -403,7 +408,7 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
     let rd = av_read_frame(fmtCtx, pkt)
     if rd == AVERROR_EOF: break
     if rd < 0: break
-    if pkt.stream_index != vidIdx.cint:
+    if pkt.stream_index != cint(vidIdx):
       av_packet_unref(pkt); continue
     if avcodec_send_packet(decCtx, pkt) < 0:
       av_packet_unref(pkt); continue
@@ -490,23 +495,23 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   let statsOnlyPass = (passNum == 1)   # true только для сбора статистики (без вывода)
 
   var inFmt: ptr AVFormatContext
-  ffCheck(avformat_open_input(addr inFmt, cfg.inputFile.cstring, nil, nil),
+  ffCheck(avformat_open_input(addr inFmt, cstring(cfg.inputFile), nil, nil),
           "открытие: " & cfg.inputFile)
   defer: avformat_close_input(addr inFmt)
   ffCheck(avformat_find_stream_info(inFmt, nil), "find_stream_info")
 
   var decoder: ptr AVCodec
   let vidIdx = av_find_best_stream(
-    inFmt, AVMEDIA_TYPE_VIDEO, -1.cint, -1.cint, cast[pointer](addr decoder), 0.cint)
+    inFmt, AVMEDIA_TYPE_VIDEO, cint(-1), cint(-1), cast[pointer](addr decoder), cint(0))
   if vidIdx < 0:
     raise newException(IOError, "видеопоток не найден: " & cfg.inputFile)
 
   if statsOnlyPass:
-    setPhase(phaseEncodePass1, estimateFrameCount(inFmt, vidIdx.cint))
+    setPhase(phaseEncodePass1, estimateFrameCount(inFmt, cint(vidIdx)))
   else:
-    setPhase(phaseTransform, estimateFrameCount(inFmt, vidIdx.cint))
+    setPhase(phaseTransform, estimateFrameCount(inFmt, cint(vidIdx)))
 
-  var decCtx = openDecoderFor(inFmt, vidIdx.cint, threads)
+  var decCtx = openDecoderFor(inFmt, cint(vidIdx), threads)
   defer: avcodec_free_context(addr decCtx)
   let inStream = inFmt.streams[vidIdx]
 
@@ -519,9 +524,11 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
     outFmt: ptr AVFormatContext = nil
     outVidStream: ptr AVStream = nil
   if not statsOnlyPass:
-    ffCheck(avformat_alloc_output_context2(addr outFmt, nil, nil, cfg.outputFile.cstring),
+    ffCheck(avformat_alloc_output_context2(addr outFmt, nil, nil, cstring(cfg.outputFile)),
             "alloc_output_context2")
     outVidStream = avformat_new_stream(outFmt, nil)
+    if outVidStream == nil:
+      raise newException(IOError, "avformat_new_stream (video) failed")
   defer:
     if outFmt != nil:
       if outFmt.pb != nil: discard avio_closep(addr outFmt.pb)
@@ -531,6 +538,8 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   if encoder == nil: raise newException(IOError, "libx264 не найден")
 
   var encCtx = avcodec_alloc_context3(encoder)
+  if encCtx == nil:
+    raise newException(IOError, "avcodec_alloc_context3 (encoder) failed")
   encCtx.width  = decCtx.width
   encCtx.height = decCtx.height
   encCtx.pix_fmt = AV_PIX_FMT_YUV420P
@@ -550,10 +559,10 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   let encFr = getStreamFpsRat(inStream)
   encCtx.framerate = encFr
   encCtx.time_base = av_inv_q(encFr)
-  encCtx.gop_size = int(getStreamFps(inStream)).cint
-  encCtx.max_b_frames = 2.cint
-  encCtx.thread_count = threads.cint
-  encCtx.thread_type  = (FF_THREAD_FRAME or FF_THREAD_SLICE).cint
+  encCtx.gop_size = cint(int(getStreamFps(inStream)))
+  encCtx.max_b_frames = cint(2)
+  encCtx.thread_count = cint(threads)
+  encCtx.thread_type  = cint(FF_THREAD_FRAME or FF_THREAD_SLICE)
   encCtx.sample_aspect_ratio = decCtx.sample_aspect_ratio
   if outFmt != nil and outFmt.oformat != nil and
      (outFmt.oformat.flags and AVFMT_GLOBALHEADER) != 0:
@@ -561,10 +570,10 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
 
   # --- Управление битрейтом: CRF (1 проход) либо ABR 2-прохода -----------
   var encOpts: ptr AVDictionary = nil
-  discard av_dict_set(addr encOpts, "preset", cfg.preset.cstring, 0)
+  discard av_dict_set(addr encOpts, "preset", cstring(cfg.preset), 0)
   case cfg.encodeMode
   of emCRF:
-    discard av_dict_set(addr encOpts, "crf", ($cfg.crf).cstring, 0)
+    discard av_dict_set(addr encOpts, "crf", cstring($cfg.crf), 0)
   of emBitrate2Pass:
     # Целевой битрейт видео — из него libx264 в 2 прохода вычисляет,
     # сколько бит выделить на каждую сцену, чтобы в среднем по ролику
@@ -578,7 +587,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
       # statsIn должен пережить весь проход кодирования — он живёт как
       # параметр этой функции, поэтому указатель остаётся валидным до
       # самого её завершения (avcodec_free_context ниже, через defer).
-      encCtx.stats_in = statsIn.cstring
+      encCtx.stats_in = cstring(statsIn)
   ffCheck(avcodec_open2(encCtx, encoder, addr encOpts), "avcodec_open2 x264")
   av_dict_free(addr encOpts)
   defer: avcodec_free_context(addr encCtx)
@@ -593,7 +602,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   # а findMap() ниже просто откинет все непопавшие в неё пакеты.
   var streamMaps: seq[StreamMap] = @[]
   if not statsOnlyPass:
-    for i in 0 ..< inFmt.nb_streams.int:
+    for i in 0 ..< int(inFmt.nb_streams):
       let st = inFmt.streams[i]
       if i == vidIdx: continue
       let
@@ -607,11 +616,11 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
       if outSt == nil: continue
       ffCheck(avcodec_parameters_copy(outSt.codecpar, st.codecpar),
               "audio/sub/attachment parameters_copy")
-      outSt.codecpar.codec_tag = 0.cuint
+      outSt.codecpar.codec_tag = cuint(0)
       outSt.time_base = st.time_base
-      add(streamMaps, StreamMap(inIdx: i.cint, outIdx: outSt.index, inTB: st.time_base))
+      add(streamMaps, StreamMap(inIdx: cint(i), outIdx: outSt.index, inTB: st.time_base))
 
-    ffCheck(avio_open(addr outFmt.pb, cfg.outputFile.cstring, AVIO_FLAG_WRITE), "avio_open")
+    ffCheck(avio_open(addr outFmt.pb, cstring(cfg.outputFile), AVIO_FLAG_WRITE), "avio_open")
     ffCheck(avformat_write_header(outFmt, nil), "write_header")
 
   # --- Фильтрграф прохода 2 -------------------------------------------------
@@ -626,18 +635,18 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
     tb = inStream.time_base
     fr = getStreamFpsRat(inStream)
     srcArgs = fmt"video_size={decCtx.width}x{decCtx.height}" &
-              fmt":pix_fmt={decCtx.pix_fmt.cint}" &
+              fmt":pix_fmt={cint(decCtx.pix_fmt)}" &
               fmt":time_base={tb.num}/{tb.den}" &
               fmt":pixel_aspect=1/1:frame_rate={fr.num}/{fr.den}"
 
   var srcCtx, sinkCtx: ptr AVFilterContext
   ffCheck(avfilter_graph_create_filter(addr srcCtx, bufFilt, "in",
-          srcArgs.cstring, nil, graph), "buffersrc create (pass2)")
+          cstring(srcArgs), nil, graph), "buffersrc create (pass2)")
   ffCheck(avfilter_graph_create_filter(addr sinkCtx, sinkFilt, "out",
           nil, nil, graph), "buffersink create (pass2)")
 
   let filterDesc = buildTransformFilterDesc(cfg, trfPath)
-  stderr.writeLine("[Monolit] Проход " & (if statsOnlyPass: "2a (сбор статистики x264)"
+  writeLine(stderr, "[Monolit] Проход " & (if statsOnlyPass: "2a (сбор статистики x264)"
                                            else: (if passNum == 2: "2b (финальный вывод)" else: "2")) &
                     " (vidstabtransform): " & filterDesc)
   flushFile(stderr)
@@ -646,7 +655,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
     outputs = avfilter_inout_alloc()
   outputs.name = av_strdup("in");  outputs.filter_ctx = srcCtx;  outputs.pad_idx = 0; outputs.next = nil
   inputs.name  = av_strdup("out"); inputs.filter_ctx  = sinkCtx; inputs.pad_idx  = 0; inputs.next  = nil
-  let pr = avfilter_graph_parse_ptr(graph, filterDesc.cstring, addr inputs, addr outputs, nil)
+  let pr = avfilter_graph_parse_ptr(graph, cstring(filterDesc), addr inputs, addr outputs, nil)
   avfilter_inout_free(addr inputs)
   avfilter_inout_free(addr outputs)
   if pr < 0:
@@ -744,7 +753,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
     if rd == AVERROR_EOF: break
     if rd < 0: break
 
-    if pkt.stream_index == vidIdx.cint:
+    if pkt.stream_index == cint(vidIdx):
       if avcodec_send_packet(decCtx, pkt) >= 0:
         while true:
           let rr = avcodec_receive_frame(decCtx, decFrame)
@@ -788,17 +797,17 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
 # ------------------------------------------------------------------------------
 proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
   let
-    threads = if cpuThreads > 0: cpuThreads else: max(1, av_cpu_count().int)
+    threads = if cpuThreads > 0: cpuThreads else: max(1, int(av_cpu_count()))
     trfPath = transformFilePath(cfg)
-  stderr.writeLine(
+  writeLine(stderr,
     "[Monolit] Старт: \"" & cfg.inputFile & "\" -> \"" & cfg.outputFile & "\" " &
     "(потоков: " & $threads & ", .trf: " & trfPath & ")")
-  stderr.writeLine(
+  writeLine(stderr,
     "[Monolit] Стабилизация: shakiness=" & $cfg.shakiness & " accuracy=" & $cfg.accuracy &
     " stepsize=" & $cfg.stepsize & " mincontrast=" & $cfg.mincontrast &
     " | smoothing=" & $cfg.smoothing & " zoom=" & $cfg.zoom &
     " optzoom=" & $cfg.optzoom & " crop=" & $cfg.crop & " interpol=" & $cfg.interpol)
-  stderr.writeLine(
+  writeLine(stderr,
     "[Monolit] Кодирование: preset=" & cfg.preset & " режим=" & $cfg.encodeMode &
     " crf=" & $cfg.crf & " битрейт=" & $cfg.videoBitrateKbps & " кбит/с")
   flushFile(stderr)
@@ -813,11 +822,11 @@ proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
       # Проход B — реальный вывод, битрейт распределяется по всему ролику
       # на основе статистики, собранной проходом A.
       discard runTransformPass(cfg, trfPath, threads, passNum = 2, statsIn = stats)
-    stderr.writeLine("[Monolit] Готово: \"" & cfg.outputFile & "\"")
+    writeLine(stderr, "[Monolit] Готово: \"" & cfg.outputFile & "\"")
     flushFile(stderr)
     setPhase(phaseDone)
   except StabCancelledError:
-    stderr.writeLine("[Monolit] Остановлено пользователем.")
+    writeLine(stderr, "[Monolit] Остановлено пользователем.")
     flushFile(stderr)
     # Недописанный результат неполон (а зачастую и физически повреждён —
     # обрыв мьюксера посреди файла), оставлять его под именем, которое
@@ -826,11 +835,11 @@ proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
       try: removeFile(cfg.outputFile) except OSError: discard
     setPhase(phaseCancelled)
   except CatchableError as e:
-    stderr.writeLine("[Monolit] ОШИБКА: " & e.msg)
+    writeLine(stderr, "[Monolit] ОШИБКА: " & e.msg)
     flushFile(stderr)
     setError(e.msg)
   finally:
-    if fileExists(trfPath) and cfg.tempDir.len == 0:
+    if fileExists(trfPath) and len(cfg.tempDir) == 0:
       # transforms.trf во временной папке ОС — подчищаем; если пользователь
       # явно указал tempDir (например, для отладки), файл оставляем.
       try: removeFile(trfPath) except OSError: discard

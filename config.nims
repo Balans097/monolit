@@ -37,7 +37,7 @@ import std/[os, strformat, strutils]
 
 proc bp(parts: varargs[string]): string = join(parts, "/")
 
-proc slashify(p: string): string = p.replace('\\', '/')
+proc slashify(p: string): string = replace(p, '\\', '/')
 
 proc findHostExe(name: string): string =
   let r = gorgeEx("which " & name & " 2>/dev/null")
@@ -51,8 +51,8 @@ proc detectJobs(): string =
 
 let
   thisFile        = slashify(currentSourcePath())
-  projectDir      = thisFile[0 ..< thisFile.rfind('/')]
-  parentOfProject = projectDir[0 ..< projectDir.rfind('/')]
+  projectDir      = thisFile[0 ..< rfind(thisFile, '/')]
+  parentOfProject = projectDir[0 ..< rfind(projectDir, '/')]
   ffmpegBranch    = "release/7.1"
   x264RepoUrl     = "https://code.videolan.org/videolan/x264.git"
   vidstabRepoUrl  = "https://github.com/georgmartius/vid.stab.git"
@@ -155,7 +155,26 @@ proc buildVidstab(src, prefix: string; windows: bool) =
     discard ensureMingwToolchain()
     add(cmakeArgs, [
       "-DCMAKE_SYSTEM_NAME=Windows",
-      "-DCMAKE_C_COMPILER=" & mingwPrefix & "gcc"
+      "-DCMAKE_C_COMPILER=" & mingwPrefix & "gcc",
+      # ПОЧЕМУ ЭТО ОБЯЗАТЕЛЬНО (это и есть исправление падения сборки под
+      # Windows): project() в CMakeLists.txt самого vid.stab не
+      # ограничивает список языков явно, поэтому CMake включает C И CXX
+      # сразу, даже если исходники библиотеки — чистый C. Без
+      # CMAKE_CXX_COMPILER, указанного явно, CMake при кросс-сборке ищет
+      # компилятор C++ штатным поиском в PATH и находит ХОСТОВЫЙ
+      # (нативный) c++/g++ вместо mingw-w64. Дальше это бьёт незаметно:
+      # CMAKE_SYSTEM_NAME=Windows заставляет CMake считать цель PE/COFF и
+      # добавлять PE-специфичные флаги компоновщика вроде
+      # --major-image-version/--minor-image-version, а получает их
+      # нативный линковщик хоста (раз CXX-компилятор хостовый), который
+      # эти флаги просто не понимает — отсюда "неизвестный параметр
+      # «--major-image-version»", и сборка тестового CXX-компилятора
+      # (CMakeTestCXXCompiler) падает ещё до генерации самого проекта.
+      # Явное указание mingw-w64 g++ синхронизирует компилятор с тем, что
+      # уже подразумевает CMAKE_SYSTEM_NAME=Windows, независимо от того,
+      # использует ли vid.stab C++ фактически.
+      "-DCMAKE_CXX_COMPILER=" & mingwPrefix & "g++",
+      "-DCMAKE_RC_COMPILER=" & mingwPrefix & "windres"
     ])
   echo "[config.nims] Сборка libvidstab..."
   exec "cmake " & join(cmakeArgs, " ") & " .."
@@ -292,24 +311,18 @@ endian = 'little'
 proc buildFFmpeg(src, prefix: string; windows: bool; x264Prefix, vidstabPrefix, dav1dPrefix: string) =
   let jobs = detectJobs()
 
-  var pkgConfigLibDir = bp(vidstabPrefix, "lib", "pkgconfig") & ":" &
-                         bp(dav1dPrefix, "lib", "pkgconfig") & ":" &
-                         bp(dav1dPrefix, "lib64", "pkgconfig") & ":" &
-                         bp(dav1dPrefix, "lib", "x86_64-linux-gnu", "pkgconfig")
-  if windows:
-    discard ensureMingwToolchain()
-    buildX264Windows(x264Src, x264Prefix)
-    pkgConfigLibDir = pkgConfigLibDir & ":" & bp(x264Prefix, "lib", "pkgconfig")
-    putEnv("PKG_CONFIG_LIBDIR", pkgConfigLibDir)
-    putEnv("PKG_CONFIG_PATH", "")
-  else:
+  if not windows:
     echo "[config.nims] Проверяем системные зависимости (dnf)..."
     if findHostExe("dnf") != "":
       exec "sudo dnf install -y nasm yasm gcc gcc-c++ make cmake pkg-config " &
            "x264-devel zlib-devel bzip2-devel xz-devel gtk4-devel || true"
-    # На нативной сборке системную libx264-devel не трогаем — vidstab и
-    # dav1d добавляем в PKG_CONFIG_PATH рядом с уже видимыми системными .pc.
-    putEnv("PKG_CONFIG_PATH", pkgConfigLibDir)
+  # ВАЖНО: сама настройка PKG_CONFIG_LIBDIR/PKG_CONFIG_PATH (включая x264 на
+  # Windows) переехала отсюда в orchestration-секцию ниже и выполняется
+  # БЕЗУСЛОВНО, а не только когда buildFFmpeg реально запускается — см.
+  # комментарий там же про то, почему это было багом.
+  if windows:
+    discard ensureMingwToolchain()
+    buildX264Windows(x264Src, x264Prefix)
 
   var configureFlags = @[
     "--prefix=\"" & prefix & "\"",
@@ -371,6 +384,55 @@ buildVidstab(vidstabSrc, vidstabPrefix, crossWindows)
 
 let dav1dPrefix = dav1dBuild
 buildDav1d(dav1dSrc, dav1dPrefix, crossWindows)
+
+# ------------------------------------------------------------------------------
+# Единая точка настройки PKG_CONFIG_LIBDIR/PKG_CONFIG_PATH — ВЫПОЛНЯЕТСЯ
+# БЕЗУСЛОВНО на каждом запуске, а не только когда buildFFmpeg реально
+# запускается (что было багом: при закэшированных FFmpeg-библиотеках
+# buildFFmpeg целиком пропускается — см. allLibsExist ниже — и переменные
+# окружения раньше просто не выставлялись, из-за чего src/gtk4_api.nim при
+# поиске gtk4 через pkg-config либо ничего не находил, либо натыкался на
+# что попало из окружения хоста). Здесь же для Windows в те же переменные
+# добавлена директория со штатным .pc-файлом mingw64-сборки GTK4 — без неё
+# `pkg-config --cflags/--libs gtk4` в src/gtk4_api.nim падал с "Package
+# gtk4 was not found in the pkg-config search path", и текст этой ошибки
+# (с обратными кавычками) утекал прямо в аргументы gcc.
+# ------------------------------------------------------------------------------
+var pkgConfigLibDir = bp(vidstabPrefix, "lib", "pkgconfig") & ":" &
+                       bp(dav1dPrefix, "lib", "pkgconfig") & ":" &
+                       bp(dav1dPrefix, "lib64", "pkgconfig") & ":" &
+                       bp(dav1dPrefix, "lib", "x86_64-linux-gnu", "pkgconfig")
+
+if crossWindows:
+  pkgConfigLibDir = pkgConfigLibDir & ":" & bp(x264Build, "lib", "pkgconfig") &
+    # Fedora кладёт .pc для mingw64-сборок (в т.ч. mingw64-gtk4) именно
+    # сюда — это стандартный путь пакетов mingw64-* в дистрибутиве, а не
+    # что-то специфичное для Monolit.
+    ":/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig"
+  putEnv("PKG_CONFIG_LIBDIR", pkgConfigLibDir)
+  putEnv("PKG_CONFIG_PATH", "")
+else:
+  # На нативной сборке системную libx264-devel не трогаем — vidstab и
+  # dav1d добавляем в PKG_CONFIG_PATH рядом с уже видимыми системными .pc
+  # (gtk4.pc там уже виден стандартными путями pkg-config, трогать не надо).
+  putEnv("PKG_CONFIG_PATH", pkgConfigLibDir)
+
+proc ensureMingwGtk4() =
+  ## Проверка ДО компиляции Nim-исходников: если pkg-config не видит gtk4
+  ## для mingw-таргета, падаем сразу с понятным сообщением — вместо того,
+  ## чтобы дать src/gtk4_api.nim впустить текст ошибки pkg-config прямо в
+  ## аргументы gcc (см. обоснование выше).
+  let r = gorgeEx("pkg-config --exists gtk4")
+  if r.exitCode != 0:
+    echo "[config.nims] [ERROR] pkg-config не находит gtk4 для mingw64. " &
+         "Установите рантайм/dev-пакет GTK4 для mingw64, например " &
+         "`sudo dnf install mingw64-gtk4` (см. README.md, «Почему GTK4 не " &
+         "статический»), либо, если он ставится не в стандартный sys-root, " &
+         "укажите его каталог pkgconfig в PKG_CONFIG_LIBDIR перед сборкой."
+    quit(1)
+
+if crossWindows:
+  ensureMingwGtk4()
 
 if allLibsExist(libDir):
   echo fmt"[config.nims] Готовые библиотеки FFmpeg найдены в {libDir} — пропускаем сборку."

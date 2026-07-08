@@ -159,7 +159,7 @@ proc av_reduce*(dst_num, dst_den: ptr cint; num, den: int64; max: int64): cint
   {.importc: "av_reduce", header: "<libavutil/rational.h>".}
 
 proc makeRat*(num, den: int): AVRational {.inline.} =
-  AVRational(num: num.cint, den: den.cint)
+  AVRational(num: cint(num), den: cint(den))
 
 # --- Математика / время -------------------------------------------------------
 proc av_rescale_q*(a: int64; bq, cq: AVRational): int64
@@ -604,7 +604,7 @@ proc ffErrStr*(code: cint): string =
   ## человекочитаемую строку через av_strerror. Буфер фиксированного
   ## размера 256 байт с лихвой хватает под любое сообщение FFmpeg.
   var buf = newString(256)
-  discard av_strerror(code, buf.cstring, 256)
+  discard av_strerror(code, cstring(buf), 256)
   # av_strerror пишет C-строку с завершающим нулём где-то внутри buf —
   # обрезаем buf по этому нулю, чтобы не тащить мусорные байты дальше.
   let z = find(buf, '\0')
