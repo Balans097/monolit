@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-# monolit
-Specialized software for the algorithmic stabilization of video sequences, implemented in Nim utilizing GTK4 for the graphical user interface.
-=======
+
 # Monolit — GTK4-приложение для стабилизации видео (libvidstab)
 
 Убирает дрожание камеры в видео с помощью двухпроходного алгоритма
