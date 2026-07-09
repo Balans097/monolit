@@ -162,6 +162,8 @@ proc gtk_window_destroy*(window: ptr GtkWindow)
 
 proc gtk_box_new*(orientation: GtkOrientation; spacing: cint): ptr GtkWidget
   {.importc: "gtk_box_new", header: "<gtk/gtk.h>".}
+proc gtk_separator_new*(orientation: GtkOrientation): ptr GtkWidget
+  {.importc: "gtk_separator_new", header: "<gtk/gtk.h>".}
 proc gtk_box_append*(box: ptr GtkBox; child: ptr GtkWidget)
   {.importc: "gtk_box_append", header: "<gtk/gtk.h>".}
 proc gtk_box_set_spacing*(box: ptr GtkBox; spacing: cint)
@@ -217,6 +219,10 @@ proc gtk_button_set_child*(btn: ptr GtkButton; child: ptr GtkWidget)
 
 proc gtk_check_button_new_with_label*(label: cstring): ptr GtkWidget
   {.importc: "gtk_check_button_new_with_label", header: "<gtk/gtk.h>".}
+proc gtk_check_button_set_label*(btn: ptr GtkCheckButton; label: cstring)
+  {.importc: "gtk_check_button_set_label", header: "<gtk/gtk.h>".}
+  ## Меняет подпись уже созданного чекбокса — нужно только для
+  ## переключения языка интерфейса на лету (см. registerTr в gui.nim).
 proc gtk_check_button_get_active*(btn: ptr GtkCheckButton): cint
   {.importc: "gtk_check_button_get_active", header: "<gtk/gtk.h>".}
 proc gtk_check_button_set_active*(btn: ptr GtkCheckButton; active: cint)
@@ -293,6 +299,31 @@ proc gtk_drop_down_get_selected*(dd: ptr GtkDropDown): cuint
   {.importc: "gtk_drop_down_get_selected", header: "<gtk/gtk.h>".}
 proc gtk_drop_down_set_selected*(dd: ptr GtkDropDown; pos: cuint)
   {.importc: "gtk_drop_down_set_selected", header: "<gtk/gtk.h>".}
+proc gtk_drop_down_get_model*(dd: ptr GtkDropDown): pointer
+  {.importc: "gtk_drop_down_get_model", header: "<gtk/gtk.h>".}
+
+# gtk_string_list_splice — как и gtk_string_list_new выше, additions здесь
+# объявлен как pointer (а не ptr cstring) по той же причине несовпадения
+# уровней const между Nim char** и C `const char* const*` (см. подробный
+# комментарий у gtk_string_list_new).
+proc gtk_string_list_splice*(list: ptr GtkStringList; position: cuint;
+                              n_removals: cuint; additions: pointer)
+  {.importc: "gtk_string_list_splice", header: "<gtk/gtk.h>".}
+
+proc setDropDownItems*(dd: ptr GtkDropDown; items: openArray[string]) =
+  ## Полностью заменяет строки модели уже существующего GtkDropDown на
+  ## новые — единственное практическое применение здесь: переключение
+  ## языка интерфейса для списков с "естественными" текстовыми пунктами
+  ## (в отличие от технических списков вроде mp4/mkv или keep/black,
+  ## которые от языка не зависят и не трогаются). В отличие от полного
+  ## пересоздания виджета, это не сбрасывает выбранный пользователем
+  ## индекс — gtk_string_list_splice заменяет содержимое ровно по тем же
+  ## позициям модели, которые отслеживает выбор GtkDropDown.
+  var cstrs = newSeq[cstring](len(items) + 1)
+  for i, s in items: cstrs[i] = cstring(s)
+  cstrs[len(items)] = nil
+  let model = cast[ptr GtkStringList](gtk_drop_down_get_model(dd))
+  gtk_string_list_splice(model, cuint(0), cuint(len(items)), addr cstrs[0])
 
 # ------------------------------------------------------------------------------
 # Своя фабрика строк списка — единственная причина, зачем она нужна:

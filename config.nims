@@ -187,7 +187,13 @@ proc buildVidstab(src, prefix: string; windows: bool) =
   let pcFile = bp(pcDir, "vidstab.pc")
   if not fileExists(pcFile):
     if not dirExists(pcDir): mkDir(pcDir)
-    writeFile(pcFile, fmt"""prefix={prefix}
+    # ${pcfiledir} — переменная, которую pkg-config подставляет САМ, равна
+    # каталогу, где лежит сам .pc-файл (здесь — {prefix}/lib/pkgconfig).
+    # Через неё prefix выражается относительно расположения .pc-файла, а
+    # не как абсолютный путь, зашитый на момент сборки, — если каталог
+    # проекта потом переименуют, скопируют на другую машину или соберут
+    # под другим пользователем, .pc остаётся рабочим без правки.
+    writeFile(pcFile, fmt"""prefix=${{pcfiledir}}/../..
 libdir=${{prefix}}/lib
 includedir=${{prefix}}/include
 

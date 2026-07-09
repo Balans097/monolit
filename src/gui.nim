@@ -14,6 +14,34 @@ import gtk4_api, stabilizer
 const MONOLIT_VERSION* = "1.3"
 
 # ------------------------------------------------------------------------------
+# Язык интерфейса — переключается на лету без перезапуска (переключатель
+# внизу вкладки «Файл», см. buildFileTab). Каждый виджет с переводимым
+# текстом регистрирует здесь замыкание "переприменить перевод к себе" (см.
+# registerTr) сразу в момент своего создания — это одновременно ставит
+# текст на текущем языке и запоминает, как обновить его позже. Такой
+# подход через реестр замыканий вместо отдельного поля под каждую подпись
+# в Widgets: переводимых виджетов (заголовки, подписи ползунков, чекбоксы,
+# заметки, заголовки вкладок) в разы больше, чем реально нужных где-то ещё
+# в обработчиках сигналов, и раздувать Widgets ради этого не хотелось.
+# ------------------------------------------------------------------------------
+type UiLang = enum uiRu, uiEn
+
+var uiLang: UiLang = uiRu   # русский — язык интерфейса по умолчанию
+
+proc tr(ru, en: string): string =
+  if uiLang == uiRu: ru else: en
+
+var uiTranslators: seq[proc () {.closure.}] = @[]
+
+proc registerTr(action: proc () {.closure.}) =
+  add(uiTranslators, action)
+  action()   # сразу применяем на текущем языке — вызывающему не нужно
+             # отдельно проставлять исходный текст самому
+
+proc applyLanguage() =
+  for action in uiTranslators: action()
+
+# ------------------------------------------------------------------------------
 # Списки значений для выпадающих списков — индекс в массиве == индекс,
 # который вернёт gtk_drop_down_get_selected().
 # ------------------------------------------------------------------------------
@@ -38,9 +66,16 @@ const
 
   # Индекс 0 обязан соответствовать EncodeMode.emCRF, индекс 1 — emBitrate2Pass
   # (см. collectConfig и onEncodeModeChanged ниже — оба жёстко завязаны на
-  # этот порядок).
-  ENCODE_MODE_ITEMS = ["1 проход (CRF)", "2 прохода (задать битрейт)"]
+  # этот порядок). Единственный список с "естественным" языком текста —
+  # поэтому единственный, чьи пункты подменяются при переключении языка
+  # интерфейса (см. onLanguageChanged) через setDropDownItems.
+  ENCODE_MODE_ITEMS_RU = ["1 проход (CRF)", "2 прохода (задать битрейт)"]
+  ENCODE_MODE_ITEMS_EN = ["1 pass (CRF)", "2 passes (set bitrate)"]
   ENCODE_MODE_DEFAULT_IDX = 0
+
+  # Названия языков традиционно показываются каждое на себе самом (в самом
+  # языке), а не переводятся — поэтому здесь нет RU/EN-варианта.
+  LANGUAGE_ITEMS = ["Русский", "English"]
 
 # ------------------------------------------------------------------------------
 # Все виджеты, к которым нужен доступ и при построении UI, и в обработчиках
@@ -90,9 +125,11 @@ type
 
     startButton:   ptr GtkButton
     startButtonLabel: ptr GtkLabel  # надпись на startButton — переключаем
-                                     # текст между "Старт" и "Стоп"
+                                     # текст между "Старт"/"Стоп" (Start/Stop)
     progressBar:   ptr GtkProgressBar
     statusLabel:   ptr GtkLabel
+
+    language:      ptr GtkDropDown  # переключатель языка интерфейса (низ вкладки «Файл»)
 
 var
   w: Widgets
@@ -116,10 +153,11 @@ proc g_timeout_add_wrapper(interval: cuint; fn: GSourceFunc; data: pointer): cui
 # Мелкие билдеры — чтобы не повторять одну и ту же разметку "подпись + control"
 # на четырёх вкладках подряд.
 # ------------------------------------------------------------------------------
-proc labeledRow(box: ptr GtkBox; caption: string; control: ptr GtkWidget) =
+proc labeledRow(box: ptr GtkBox; captionRu, captionEn: string; control: ptr GtkWidget) =
   let
     row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
-    lbl = gtk_label_new(cstring(caption))
+    lbl = gtk_label_new(nil)
+  registerTr(proc () = gtk_label_set_text(cast[ptr GtkLabel](lbl), cstring(tr(captionRu, captionEn))))
   gtk_label_set_xalign(cast[ptr GtkLabel](lbl), 0.0)
   gtk_widget_set_hexpand(lbl, cint(0))
   gtk_widget_set_hexpand(control, cint(1))
@@ -127,7 +165,7 @@ proc labeledRow(box: ptr GtkBox; caption: string; control: ptr GtkWidget) =
   gtk_box_append(cast[ptr GtkBox](row), control)
   gtk_box_append(box, row)
 
-proc newScaleRow(box: ptr GtkBox; caption: string;
+proc newScaleRow(box: ptr GtkBox; captionRu, captionEn: string;
                   min, max, step, initial: float; digits: int): ptr GtkRange =
   let scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
                                         cdouble(min), cdouble(max), cdouble(step))
@@ -138,14 +176,14 @@ proc newScaleRow(box: ptr GtkBox; caption: string;
   gtk_scale_set_draw_value(cast[ptr GtkScale](scale), cint(1))
   gtk_scale_set_value_pos(cast[ptr GtkScale](scale), GTK_POS_RIGHT)
   gtk_range_set_value(cast[ptr GtkRange](scale), cdouble(initial))
-  labeledRow(box, caption, scale)
+  labeledRow(box, captionRu, captionEn, scale)
   result = cast[ptr GtkRange](scale)
 
-proc newDropDownRow(box: ptr GtkBox; caption: string;
+proc newDropDownRow(box: ptr GtkBox; captionRu, captionEn: string;
                      items: openArray[string]; defaultIdx: int): ptr GtkDropDown =
   let dd = newDropDown(items)
   gtk_drop_down_set_selected(cast[ptr GtkDropDown](dd), cuint(defaultIdx))
-  labeledRow(box, caption, dd)
+  labeledRow(box, captionRu, captionEn, dd)
   result = cast[ptr GtkDropDown](dd)
 
 # ------------------------------------------------------------------------------
@@ -155,33 +193,44 @@ proc newDropDownRow(box: ptr GtkBox; caption: string;
 # создания виджета, а для чекбокса/кнопки подпись приходится собирать
 # вручную как child-виджет вместо параметра label.
 # ------------------------------------------------------------------------------
-proc newBoldLabel(text: string): ptr GtkWidget =
-  result = gtk_label_new(nil)
-  gtk_label_set_markup(cast[ptr GtkLabel](result), cstring("<b>" & text & "</b>"))
-  gtk_label_set_xalign(cast[ptr GtkLabel](result), 0.0)
+proc newBoldLabel(ru, en: string): ptr GtkWidget =
+  let lbl = gtk_label_new(nil)
+  registerTr(proc () = gtk_label_set_markup(cast[ptr GtkLabel](lbl), cstring("<b>" & tr(ru, en) & "</b>")))
+  gtk_label_set_xalign(cast[ptr GtkLabel](lbl), 0.0)
+  result = lbl
 
-proc newItalicLabel(text: string): ptr GtkWidget =
-  result = gtk_label_new(nil)
-  gtk_label_set_markup(cast[ptr GtkLabel](result), cstring("<i>" & text & "</i>"))
-  gtk_label_set_xalign(cast[ptr GtkLabel](result), 0.0)
+proc newItalicLabel(ru, en: string): ptr GtkWidget =
+  let lbl = gtk_label_new(nil)
+  registerTr(proc () = gtk_label_set_markup(cast[ptr GtkLabel](lbl), cstring("<i>" & tr(ru, en) & "</i>")))
+  gtk_label_set_xalign(cast[ptr GtkLabel](lbl), 0.0)
+  result = lbl
 
-proc newBoldCheckButton(caption: string): ptr GtkWidget =
+proc newBoldCheckButton(ru, en: string): ptr GtkWidget =
   result = gtk_check_button_new()
-  let lbl = newBoldLabel(caption)
+  let lbl = newBoldLabel(ru, en)
   gtk_check_button_set_child(cast[ptr GtkCheckButton](result), lbl)
 
-proc newBoldButton(caption: string): ptr GtkWidget =
+proc newBoldButton(ru, en: string): ptr GtkWidget =
   result = gtk_button_new()
-  let lbl = newBoldLabel(caption)
+  let lbl = newBoldLabel(ru, en)
   gtk_button_set_child(cast[ptr GtkButton](result), lbl)
 
-proc newPage(tabTitle: string; notebook: ptr GtkNotebook): ptr GtkBox =
+proc newCheckButton(ru, en: string): ptr GtkWidget =
+  ## Обычный (не полужирный) чекбокс со встроенной GTK-подписью — в
+  ## отличие от newBoldCheckButton, здесь подпись хранится самим GTK
+  ## (gtk_check_button_set_label), а не отдельным Label-child.
+  result = gtk_check_button_new()
+  registerTr(proc () = gtk_check_button_set_label(cast[ptr GtkCheckButton](result), cstring(tr(ru, en))))
+
+proc newPage(tabTitleRu, tabTitleEn: string; notebook: ptr GtkNotebook): ptr GtkBox =
   let page = gtk_box_new(GTK_ORIENTATION_VERTICAL, cint(8))
   gtk_widget_set_margin_top(page, cint(12))
   gtk_widget_set_margin_bottom(page, cint(12))
   gtk_widget_set_margin_start(page, cint(12))
   gtk_widget_set_margin_end(page, cint(12))
-  discard gtk_notebook_append_page(notebook, page, gtk_label_new(cstring(tabTitle)))
+  let tabLabel = gtk_label_new(nil)
+  registerTr(proc () = gtk_label_set_text(cast[ptr GtkLabel](tabLabel), cstring(tr(tabTitleRu, tabTitleEn))))
+  discard gtk_notebook_append_page(notebook, page, tabLabel)
   result = cast[ptr GtkBox](page)
 
 # ------------------------------------------------------------------------------
@@ -245,12 +294,12 @@ proc onContainerChanged(dd: pointer; pspec: pointer; userData: pointer) {.cdecl.
 
 proc onPickInput(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
   let filt = gtk_file_filter_new()
-  gtk_file_filter_set_name(filt, cstring("Видео"))
+  gtk_file_filter_set_name(filt, cstring(tr("Видео", "Video")))
   for pat in ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"]:
     gtk_file_filter_add_pattern(filt, cstring(pat))
   let dlg = gtk_file_chooser_native_new(
-    cstring("Выберите исходное видео"), w.window,
-    GTK_FILE_CHOOSER_ACTION_OPEN, cstring("Открыть"), cstring("Отмена"))
+    cstring(tr("Выберите исходное видео", "Choose source video")), w.window,
+    GTK_FILE_CHOOSER_ACTION_OPEN, cstring(tr("Открыть", "Open")), cstring(tr("Отмена", "Cancel")))
   gtk_file_chooser_add_filter(cast[pointer](dlg), filt)
   connect(cast[pointer](dlg), "response", onOpenResponse)
   gtk_native_dialog_show(cast[pointer](dlg))
@@ -258,22 +307,34 @@ proc onPickInput(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
 proc onPickOutput(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
   let ext = selectedContainerExt()
   let dlg = gtk_file_chooser_native_new(
-    cstring("Сохранить стабилизированное видео как"), w.window,
-    GTK_FILE_CHOOSER_ACTION_SAVE, cstring("Сохранить"), cstring("Отмена"))
+    cstring(tr("Сохранить стабилизированное видео как", "Save stabilized video as")), w.window,
+    GTK_FILE_CHOOSER_ACTION_SAVE, cstring(tr("Сохранить", "Save")), cstring(tr("Отмена", "Cancel")))
   let filt = gtk_file_filter_new()
-  gtk_file_filter_set_name(filt, cstring(ext & " видео"))
+  gtk_file_filter_set_name(filt, cstring(ext & " " & tr("видео", "video")))
   gtk_file_filter_add_pattern(filt, cstring("*." & ext))
   gtk_file_chooser_add_filter(cast[pointer](dlg), filt)
   gtk_file_chooser_set_current_name(cast[pointer](dlg), cstring("stabilized." & ext))
   connect(cast[pointer](dlg), "response", onSaveResponse)
   gtk_native_dialog_show(cast[pointer](dlg))
 
+proc onLanguageChanged(dd: pointer; pspec: pointer; userData: pointer) {.cdecl.} =
+  let idx = int(gtk_drop_down_get_selected(cast[ptr GtkDropDown](dd)))
+  uiLang = if idx == 0: uiRu else: uiEn
+  # ENCODE_MODE_ITEMS — единственный список с "естественным" (не
+  # техническим) текстом пунктов, поэтому единственный, чьи пункты нужно
+  # физически подменить; остальные подписи обновляет applyLanguage() ниже
+  # через реестр registerTr.
+  setDropDownItems(w.encodeMode, if uiLang == uiRu: ENCODE_MODE_ITEMS_RU else: ENCODE_MODE_ITEMS_EN)
+  applyLanguage()
+
 proc buildFileTab(notebook: ptr GtkNotebook) =
-  let page = newPage("Файл", notebook)
+  let page = newPage("Файл", "File", notebook)
 
   let
     inRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
-    inBtn = gtk_button_new_with_label(cstring("Выбрать исходное видео..."))
+    inBtn = gtk_button_new()
+  registerTr(proc () = gtk_button_set_label(cast[ptr GtkButton](inBtn),
+    cstring(tr("Выбрать исходное видео...", "Choose source video..."))))
   w.inputLabel = cast[ptr GtkLabel](gtk_label_new(cstring(cfg.inputFile)))
   gtk_label_set_xalign(w.inputLabel, 0.0)
   gtk_widget_set_hexpand(cast[ptr GtkWidget](w.inputLabel), cint(1))
@@ -284,7 +345,9 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
 
   let
     outRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
-    outBtn = gtk_button_new_with_label(cstring("Куда сохранить..."))
+    outBtn = gtk_button_new()
+  registerTr(proc () = gtk_button_set_label(cast[ptr GtkButton](outBtn),
+    cstring(tr("Куда сохранить...", "Save to..."))))
   w.outputLabel = cast[ptr GtkLabel](gtk_label_new(cstring(cfg.outputFile)))
   gtk_label_set_xalign(w.outputLabel, 0.0)
   gtk_widget_set_hexpand(cast[ptr GtkWidget](w.outputLabel), cint(1))
@@ -293,17 +356,20 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
   gtk_box_append(cast[ptr GtkBox](outRow), cast[ptr GtkWidget](w.outputLabel))
   gtk_box_append(page, outRow)
 
-  w.container = newDropDownRow(page, "Контейнер результата",
+  w.container = newDropDownRow(page, "Контейнер результата", "Output container",
                                 CONTAINER_ITEMS, CONTAINER_DEFAULT_IDX)
   connect(cast[pointer](w.container), "notify::selected", onContainerChanged)
   let containerNote = newItalicLabel(
     "mkv надёжнее сохраняет субтитры и вложения (шрифты); mp4 — самый\n" &
     "совместимый вариант для проигрывателей и сайтов. Расширение файла\n" &
-    "в диалоге «Куда сохранить...» подставляется по этому выбору.")
+    "в диалоге «Куда сохранить...» подставляется по этому выбору.",
+    "mkv preserves subtitles and attachments (fonts) more reliably; mp4\n" &
+    "is the most compatible option for players and websites. The file\n" &
+    "extension in the \"Save to...\" dialog follows this choice.")
   gtk_widget_set_margin_bottom(containerNote, cint(6))
   gtk_box_append(page, containerNote)
 
-  let audioChk = gtk_check_button_new_with_label(cstring("Копировать звук без перекодирования"))
+  let audioChk = newCheckButton("Копировать звук без перекодирования", "Copy audio without re-encoding")
   gtk_check_button_set_active(cast[ptr GtkCheckButton](audioChk), cint(1))
   w.copyAudio = cast[ptr GtkCheckButton](audioChk)
   gtk_box_append(page, audioChk)
@@ -312,7 +378,7 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
   # флагом copyAudio на оба типа потоков) — теперь это два независимых
   # переключателя: можно, например, сохранить звук, но выкинуть субтитры,
   # или наоборот.
-  let subsChk = gtk_check_button_new_with_label(cstring("Сохранить субтитры"))
+  let subsChk = newCheckButton("Сохранить субтитры", "Keep subtitles")
   gtk_check_button_set_active(cast[ptr GtkCheckButton](subsChk), cint(1))
   w.saveSubtitles = cast[ptr GtkCheckButton](subsChk)
   gtk_box_append(page, subsChk)
@@ -320,44 +386,73 @@ proc buildFileTab(notebook: ptr GtkNotebook) =
   # "Вложения" контейнера — это, как правило, встроенные в mkv шрифты
   # (нужны для корректного отображения стилизованных субтитров ASS/SSA)
   # и другие произвольные файлы, которые можно прикрепить к mkv-контейнеру.
-  let attachChk = gtk_check_button_new_with_label(cstring("Сохранить вложения (шрифты и т.п.)"))
+  let attachChk = newCheckButton("Сохранить вложения (шрифты и т.п.)", "Keep attachments (fonts, etc.)")
   gtk_check_button_set_active(cast[ptr GtkCheckButton](attachChk), cint(1))
   w.saveAttachments = cast[ptr GtkCheckButton](attachChk)
   gtk_box_append(page, attachChk)
+
+  # --- Язык интерфейса --------------------------------------------------------
+  # По явному требованию — переключатель языка внизу именно вкладки
+  # «Файл», а не где-то в общей области окна. Разделитель сверху отделяет
+  # его от настроек контейнера/звука визуально, чтобы не выглядело единым
+  # списком с ними.
+  let sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL)
+  gtk_widget_set_margin_top(sep, cint(14))
+  gtk_widget_set_margin_bottom(sep, cint(6))
+  gtk_box_append(page, sep)
+
+  w.language = newDropDownRow(page, "Язык интерфейса", "Interface language",
+                               LANGUAGE_ITEMS, 0)
+  connect(cast[pointer](w.language), "notify::selected", onLanguageChanged)
 
 # ------------------------------------------------------------------------------
 # Вкладка «Стабилизация»
 # ------------------------------------------------------------------------------
 proc buildStabTab(notebook: ptr GtkNotebook) =
-  let page = newPage("Стабилизация", notebook)
+  let page = newPage("Стабилизация", "Stabilization", notebook)
 
-  let hdr1 = newBoldLabel("Проход 1 — анализ движения (vidstabdetect)")
+  let hdr1 = newBoldLabel("Проход 1 — анализ движения (vidstabdetect)",
+                           "Pass 1 — motion analysis (vidstabdetect)")
   gtk_box_append(page, hdr1)
 
-  w.shakiness   = newScaleRow(page, "Резкость тряски (shakiness)",   1, 10, 1, 10, 0)
-  w.accuracy    = newScaleRow(page, "Точность анализа (accuracy)",    1, 15, 1, 15, 0)
-  w.stepsize    = newScaleRow(page, "Шаг поиска (stepsize)",          1, 32, 1, 1,  0)
-  w.mincontrast = newScaleRow(page, "Мин. контраст (mincontrast)",    0.0, 1.0, 0.05, 0.3, 2)
+  w.shakiness   = newScaleRow(page, "Резкость тряски (shakiness)", "Shakiness",
+                               1, 10, 1, 10, 0)
+  w.accuracy    = newScaleRow(page, "Точность анализа (accuracy)", "Accuracy",
+                               1, 15, 1, 15, 0)
+  w.stepsize    = newScaleRow(page, "Шаг поиска (stepsize)", "Step size",
+                               1, 32, 1, 1,  0)
+  w.mincontrast = newScaleRow(page, "Мин. контраст (mincontrast)", "Min. contrast",
+                               0.0, 1.0, 0.05, 0.3, 2)
 
-  let hdr2 = newBoldLabel("Проход 2 — компенсация (vidstabtransform)")
+  let hdr2 = newBoldLabel("Проход 2 — компенсация (vidstabtransform)",
+                           "Pass 2 — compensation (vidstabtransform)")
   gtk_widget_set_margin_top(hdr2, cint(12))
   gtk_box_append(page, hdr2)
 
-  w.smoothing = newScaleRow(page, "Сглаживание (кадров)", 0, 200, 1, 30, 0)
-  w.zoom      = newScaleRow(page, "Базовый зум, %",       0, 50,  1, 0,  0)
-  w.optzoom   = newDropDownRow(page, "Автозум (optzoom): 0=выкл 1=статич. 2=адаптивн.",
-                                ["0", "1", "2"], 2)
-  w.crop      = newDropDownRow(page, "Края кадра (crop)", CROP_ITEMS, CROP_DEFAULT_IDX)
-  w.interpol  = newDropDownRow(page, "Интерполяция (interpol)", INTERPOL_ITEMS,
-                                INTERPOL_DEFAULT_IDX)
+  w.smoothing = newScaleRow(page, "Сглаживание (кадров)", "Smoothing (frames)",
+                             0, 200, 1, 30, 0)
+  w.zoom      = newScaleRow(page, "Базовый зум, %", "Base zoom, %",
+                             0, 50,  1, 0,  0)
+  w.optzoom   = newDropDownRow(page,
+                  "Автозум (optzoom): 0=выкл 1=статич. 2=адаптивн.",
+                  "Auto zoom (optzoom): 0=off 1=static 2=adaptive",
+                  ["0", "1", "2"], 2)
+  w.crop      = newDropDownRow(page, "Края кадра (crop)", "Frame edges (crop)",
+                                CROP_ITEMS, CROP_DEFAULT_IDX)
+  w.interpol  = newDropDownRow(page, "Интерполяция (interpol)", "Interpolation",
+                                INTERPOL_ITEMS, INTERPOL_DEFAULT_IDX)
   w.maxShift  = newScaleRow(page, "Макс. сдвиг, px (-1 = без ограничения)",
+                             "Max shift, px (-1 = unlimited)",
                              -1, 500, 1, -1, 0)
   w.maxAngle  = newScaleRow(page, "Макс. угол, рад (-1 = без ограничения)",
+                             "Max angle, rad (-1 = unlimited)",
                              -1, 3, 0.05, -1, 2)
 
   let note = newItalicLabel(
     "«Чёрные поля» = crop=black; вариант «keep» дотягивает картинку\n" &
-    "с предыдущего кадра вместо чёрной рамки.")
+    "с предыдущего кадра вместо чёрной рамки.",
+    "\"Black bars\" = crop=black; the \"keep\" option stretches the\n" &
+    "previous frame's image instead of a black border.")
   gtk_widget_set_margin_top(note, cint(6))
   gtk_box_append(page, note)
 
@@ -377,34 +472,43 @@ proc onFilterToggled(cb: ptr GtkCheckButton; userData: pointer) {.cdecl.} =
   if cb != w.casEnabled:       gtk_check_button_set_active(w.casEnabled, cint(0))
 
 proc buildSharpenTab(notebook: ptr GtkNotebook) =
-  let page = newPage("Резкость", notebook)
+  let page = newPage("Резкость", "Sharpness", notebook)
 
   # --- smartblur: опциональное шумоподавление/смягчение ---------------------
   let sbChk = newBoldCheckButton(
-    "Применить Smart Blur (smartblur) — шумоподавление/смягчение")
+    "Применить Smart Blur (smartblur) — шумоподавление/смягчение",
+    "Apply Smart Blur (smartblur) — noise reduction/softening")
   w.smartblurEnabled = cast[ptr GtkCheckButton](sbChk)
   gtk_box_append(page, sbChk)
 
-  w.smartblurRadius    = newScaleRow(page, "Радиус (luma_radius)",    0.1, 5.0, 0.1, 1.0, 1)
-  w.smartblurStrength  = newScaleRow(page, "Сила (luma_strength)",   -1.0, 1.0, 0.05, 1.0, 2)
-  w.smartblurThreshold = newScaleRow(page, "Порог (luma_threshold)", -30, 30, 1, 0, 0)
+  w.smartblurRadius    = newScaleRow(page, "Радиус (luma_radius)", "Radius (luma_radius)",
+                                      0.1, 5.0, 0.1, 1.0, 1)
+  w.smartblurStrength  = newScaleRow(page, "Сила (luma_strength)", "Strength (luma_strength)",
+                                      -1.0, 1.0, 0.05, 1.0, 2)
+  w.smartblurThreshold = newScaleRow(page, "Порог (luma_threshold)", "Threshold (luma_threshold)",
+                                      -30, 30, 1, 0, 0)
 
   let sbNote = newItalicLabel(
     "Smart Blur ставится ПЕРЕД фильтрами резкости ниже: резкость усиливает\n" &
-    "уже имеющийся шум, поэтому шумоподавление имеет смысл делать раньше.")
+    "уже имеющийся шум, поэтому шумоподавление имеет смысл делать раньше.",
+    "Smart Blur is applied BEFORE the sharpening filters below: sharpening\n" &
+    "amplifies existing noise, so denoising makes sense to do first.")
   gtk_widget_set_margin_top(sbNote, cint(6))
   gtk_widget_set_margin_bottom(sbNote, cint(6))
   gtk_box_append(page, sbNote)
 
   # --- unsharp: классическая резкость ----------------------------------------
-  let chk = newBoldCheckButton("Повысить резкость после стабилизации (unsharp)")
+  let chk = newBoldCheckButton("Повысить резкость после стабилизации (unsharp)",
+                                "Increase sharpness after stabilization (unsharp)")
   w.sharpenEnabled = cast[ptr GtkCheckButton](chk)
   gtk_box_append(page, chk)
 
-  w.sharpenAmount = newScaleRow(page, "Сила резкости (luma_amount)", 0.0, 3.0, 0.1, 0.5, 2)
+  w.sharpenAmount = newScaleRow(page, "Сила резкости (luma_amount)", "Sharpen strength (luma_amount)",
+                                 0.0, 3.0, 0.1, 0.5, 2)
 
   # --- cas: Contrast Adaptive Sharpening -------------------------------------
-  let casChk = newBoldCheckButton("Применить Contrast Adaptive Sharpening (cas)")
+  let casChk = newBoldCheckButton("Применить Contrast Adaptive Sharpening (cas)",
+                                   "Apply Contrast Adaptive Sharpening (cas)")
   w.casEnabled = cast[ptr GtkCheckButton](casChk)
   gtk_widget_set_margin_top(casChk, cint(6))
   # По умолчанию включаем именно cas: из трёх фильтров резкости он меньше
@@ -415,7 +519,7 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
   gtk_check_button_set_active(cast[ptr GtkCheckButton](casChk), cint(1))
   gtk_box_append(page, casChk)
 
-  w.casStrength = newScaleRow(page, "Сила (strength)", 0.0, 1.0, 0.05, 0.7, 2)
+  w.casStrength = newScaleRow(page, "Сила (strength)", "Strength", 0.0, 1.0, 0.05, 0.7, 2)
 
   # Три фильтра исключают друг друга: одновременное включение двух-трёх из
   # них, по всей видимости, лишено смысла (каждый по-своему борется с
@@ -430,7 +534,11 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
     "Резкость (unsharp/cas) применяется ПОСЛЕ стабилизации/зума — иначе\n" &
     "усиливаются артефакты исходной тряски вместо деталей кадра. Включить\n" &
     "можно только один из трёх фильтров — cas меньше «звенит» на\n" &
-    "контрастных краях, чем классический unsharp.")
+    "контрастных краях, чем классический unsharp.",
+    "Sharpening (unsharp/cas) is applied AFTER stabilization/zoom — otherwise\n" &
+    "it amplifies shake artifacts instead of frame detail. Only one of the\n" &
+    "three filters can be enabled at a time — cas \"rings\" less on high-\n" &
+    "contrast edges than classic unsharp.")
   gtk_widget_set_margin_top(note, cint(6))
   gtk_box_append(page, note)
 
@@ -449,15 +557,18 @@ proc onEncodeModeChanged(dd: pointer; pspec: pointer; userData: pointer) {.cdecl
   gtk_widget_set_sensitive(cast[ptr GtkWidget](w.videoBitrate), cint(isTwoPass))
 
 proc buildCompressionTab(notebook: ptr GtkNotebook) =
-  let page = newPage("Компрессия", notebook)
+  let page = newPage("Компрессия", "Compression", notebook)
 
-  w.encodeMode = newDropDownRow(page, "Режим сжатия", ENCODE_MODE_ITEMS,
-                                 ENCODE_MODE_DEFAULT_IDX)
+  w.encodeMode = newDropDownRow(page, "Режим сжатия", "Compression mode",
+                                 ENCODE_MODE_ITEMS_RU, ENCODE_MODE_DEFAULT_IDX)
   connect(cast[pointer](w.encodeMode), "notify::selected", onEncodeModeChanged)
 
-  w.preset = newDropDownRow(page, "Preset libx264", PRESET_ITEMS, PRESET_DEFAULT_IDX)
-  w.crf    = newScaleRow(page, "CRF (0=без потерь, 51=худшее качество)", 0, 51, 1, 16, 0)
+  w.preset = newDropDownRow(page, "Preset libx264", "Preset libx264",
+                             PRESET_ITEMS, PRESET_DEFAULT_IDX)
+  w.crf    = newScaleRow(page, "CRF (0=без потерь, 51=худшее качество)",
+                          "CRF (0=lossless, 51=worst quality)", 0, 51, 1, 16, 0)
   w.videoBitrate = newScaleRow(page, "Целевой битрейт видео, кбит/с",
+                                "Target video bitrate, kbps",
                                 500, 50000, 100, 8000, 0)
 
   # По умолчанию выбран режим "1 проход (CRF)" — битрейт в нём не участвует
@@ -472,7 +583,10 @@ proc buildCompressionTab(notebook: ptr GtkNotebook) =
   let noteCRF = newItalicLabel(
     "«1 проход (CRF)» — постоянное качество на всём ролике; быстрее, но\n" &
     "итоговый размер файла заранее не предсказать. Для «наивысшего\n" &
-    "качества» — preset=slow/slower и CRF 16-18.")
+    "качества» — preset=slow/slower и CRF 16-18.",
+    "\"1 pass (CRF)\" — constant quality across the whole clip; faster, but\n" &
+    "the final file size can't be predicted in advance. For \"highest\n" &
+    "quality\" use preset=slow/slower and CRF 16-18.")
   gtk_widget_set_margin_top(noteCRF, cint(6))
   gtk_box_append(page, noteCRF)
 
@@ -480,7 +594,11 @@ proc buildCompressionTab(notebook: ptr GtkNotebook) =
     "«2 прохода (битрейт)» — libx264 сначала проходит весь ролик, считая\n" &
     "статистику сложности сцен, затем кодирует повторно, распределяя биты\n" &
     "так, чтобы точно попасть в заданный битрейт/размер файла — вдвое\n" &
-    "медленнее, зато предсказуемый результат.")
+    "медленнее, зато предсказуемый результат.",
+    "\"2 passes (bitrate)\" — libx264 first scans the whole clip gathering\n" &
+    "scene-complexity statistics, then encodes again, distributing bits\n" &
+    "so the target bitrate/file size is hit precisely — twice as slow,\n" &
+    "but the result is predictable.")
   gtk_widget_set_margin_top(note2Pass, cint(10))   # вертикальный пробел между абзацами
   gtk_box_append(page, note2Pass)
 
@@ -515,7 +633,7 @@ proc collectConfig(): StabConfig =
 
   result.preset     = PRESET_ITEMS[int(gtk_drop_down_get_selected(w.preset))]
   # Индекс 0 = "1 проход (CRF)" = emCRF, индекс 1 = "2 прохода" = emBitrate2Pass
-  # (см. ENCODE_MODE_ITEMS выше — порядок жёстко согласован с EncodeMode).
+  # (см. ENCODE_MODE_ITEMS_RU/EN выше — порядок жёстко согласован с EncodeMode).
   result.encodeMode = if gtk_drop_down_get_selected(w.encodeMode) == cuint(0):
                          emCRF
                        else:
@@ -533,6 +651,15 @@ proc collectConfig(): StabConfig =
 proc processingThreadProc(jobCfg: StabConfig) {.thread.} =
   runStabilization(jobCfg)
 
+proc updateStartButtonLabel() =
+  ## Общая точка обновления надписи на кнопке «Старт»/«Стоп» — и для смены
+  ## состояния (idle/выполняется), и для переключения языка интерфейса.
+  ## Через gtk_label_set_markup, а не gtk_label_set_text: надпись изначально
+  ## полужирная (см. onActivate), а gtk_label_set_text сбрасывает
+  ## use-markup в FALSE и показывает голый текст без форматирования.
+  let text = (if jobRunning: tr("Стоп", "Stop") else: tr("Старт", "Start"))
+  gtk_label_set_markup(w.startButtonLabel, cstring("<b>" & text & "</b>"))
+
 proc onProgressTick(userData: pointer): cint {.cdecl.} =
   let (phase, done, total, errMsg) = getStabProgress()
 
@@ -540,45 +667,48 @@ proc onProgressTick(userData: pointer): cint {.cdecl.} =
   of phaseAnalyze:
     let frac = if total > 0: min(1.0, float(done) / float(total)) else: 0.0
     gtk_progress_bar_set_fraction(w.progressBar, cdouble(frac))
-    gtk_label_set_text(w.statusLabel,
-      cstring(fmt"Проход 1/2 — анализ движения: {done}/{total} кадров"))
+    gtk_label_set_text(w.statusLabel, cstring(tr(
+      fmt"Проход 1/2 — анализ движения: {done}/{total} кадров",
+      fmt"Pass 1/2 — motion analysis: {done}/{total} frames")))
     return cint(1)   # G_SOURCE_CONTINUE — таймер продолжает тикать
 
   of phaseEncodePass1:
     let frac = if total > 0: min(1.0, float(done) / float(total)) else: 0.0
     gtk_progress_bar_set_fraction(w.progressBar, cdouble(frac))
-    gtk_label_set_text(w.statusLabel,
-      cstring(fmt"Кодирование, проход A/2 — сбор статистики битрейта: {done}/{total} кадров"))
+    gtk_label_set_text(w.statusLabel, cstring(tr(
+      fmt"Кодирование, проход A/2 — сбор статистики битрейта: {done}/{total} кадров",
+      fmt"Encoding, pass A/2 — gathering bitrate statistics: {done}/{total} frames")))
     return cint(1)
 
   of phaseTransform:
     let frac = if total > 0: min(1.0, float(done) / float(total)) else: 0.0
     gtk_progress_bar_set_fraction(w.progressBar, cdouble(frac))
-    gtk_label_set_text(w.statusLabel,
-      cstring(fmt"Проход 2/2 — стабилизация и кодирование: {done}/{total} кадров"))
+    gtk_label_set_text(w.statusLabel, cstring(tr(
+      fmt"Проход 2/2 — стабилизация и кодирование: {done}/{total} кадров",
+      fmt"Pass 2/2 — stabilization and encoding: {done}/{total} frames")))
     return cint(1)
 
   of phaseDone:
     gtk_progress_bar_set_fraction(w.progressBar, 1.0)
-    gtk_label_set_text(w.statusLabel, cstring("Готово."))
+    gtk_label_set_text(w.statusLabel, cstring(tr("Готово.", "Done.")))
     jobRunning = false
-    gtk_label_set_text(w.startButtonLabel, cstring("Старт"))
+    updateStartButtonLabel()
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
     return G_SOURCE_REMOVE
 
   of phaseError:
-    gtk_label_set_text(w.statusLabel, cstring(fmt"Ошибка: {errMsg}"))
+    gtk_label_set_text(w.statusLabel, cstring(tr(fmt"Ошибка: {errMsg}", fmt"Error: {errMsg}")))
     jobRunning = false
-    gtk_label_set_text(w.startButtonLabel, cstring("Старт"))
+    updateStartButtonLabel()
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
     return G_SOURCE_REMOVE
 
   of phaseCancelled:
-    gtk_label_set_text(w.statusLabel, cstring("Остановлено пользователем."))
+    gtk_label_set_text(w.statusLabel, cstring(tr("Остановлено пользователем.", "Stopped by user.")))
     jobRunning = false
-    gtk_label_set_text(w.startButtonLabel, cstring("Старт"))
+    updateStartButtonLabel()
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
     return G_SOURCE_REMOVE
@@ -594,24 +724,24 @@ proc onStartStopClicked(btn: ptr GtkButton; userData: pointer) {.cdecl.} =
     # заметит phaseCancelled и вернёт кнопку в состояние «Старт». Пока
     # поток не подтвердил остановку, блокируем кнопку от повторных кликов.
     requestCancel()
-    gtk_label_set_text(w.statusLabel, cstring("Останавливаем..."))
+    gtk_label_set_text(w.statusLabel, cstring(tr("Останавливаем...", "Stopping...")))
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(0))
     return
 
   if len(cfg.inputFile) == 0 or not fileExists(cfg.inputFile):
-    gtk_label_set_text(w.statusLabel, cstring("Сначала выберите исходный файл."))
+    gtk_label_set_text(w.statusLabel, cstring(tr("Сначала выберите исходный файл.", "Choose a source file first.")))
     return
   if len(cfg.outputFile) == 0:
-    gtk_label_set_text(w.statusLabel, cstring("Укажите, куда сохранить результат."))
+    gtk_label_set_text(w.statusLabel, cstring(tr("Укажите, куда сохранить результат.", "Specify where to save the result.")))
     return
 
   let jobCfg = collectConfig()
   cfg = jobCfg
 
   jobRunning = true
-  gtk_label_set_text(w.startButtonLabel, cstring("Стоп"))
+  updateStartButtonLabel()
   gtk_progress_bar_set_fraction(w.progressBar, 0.0)
-  gtk_label_set_text(w.statusLabel, cstring("Запуск..."))
+  gtk_label_set_text(w.statusLabel, cstring(tr("Запуск...", "Starting...")))
 
   initStabProgress()
   createThread(procThread, processingThreadProc, jobCfg)
@@ -658,7 +788,9 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
 
   let window = gtk_application_window_new(app)
   w.window = cast[ptr GtkWindow](window)
-  gtk_window_set_title(w.window, cstring(fmt"Monolit v{MONOLIT_VERSION} — стабилизация видео"))
+  registerTr(proc () = gtk_window_set_title(w.window, cstring(tr(
+    fmt"Monolit v{MONOLIT_VERSION} — стабилизация видео",
+    fmt"Monolit v{MONOLIT_VERSION} — video stabilization"))))
   gtk_window_set_default_size(w.window, cint(620), cint(560))
 
   let root = gtk_box_new(GTK_ORIENTATION_VERTICAL, cint(8))
@@ -678,11 +810,12 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
 
   let
     controlRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, cint(12))
-    startStopLabel = newBoldLabel("Старт")
+    startStopLabel = gtk_label_new(nil)
     startBtn = gtk_button_new()
   gtk_button_set_child(cast[ptr GtkButton](startBtn), startStopLabel)
   w.startButton = cast[ptr GtkButton](startBtn)
   w.startButtonLabel = cast[ptr GtkLabel](startStopLabel)
+  registerTr(updateStartButtonLabel)
   connect(cast[pointer](startBtn), "clicked", onStartStopClicked)
 
   let pbar = gtk_progress_bar_new()
@@ -694,9 +827,10 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
   gtk_box_append(cast[ptr GtkBox](controlRow), pbar)
   gtk_box_append(cast[ptr GtkBox](root), controlRow)
 
-  let status = gtk_label_new(cstring("Готово к запуску."))
+  let status = gtk_label_new(nil)
   gtk_label_set_xalign(cast[ptr GtkLabel](status), 0.0)
   w.statusLabel = cast[ptr GtkLabel](status)
+  registerTr(proc () = gtk_label_set_text(w.statusLabel, cstring(tr("Готово к запуску.", "Ready to start."))))
   gtk_box_append(cast[ptr GtkBox](root), status)
 
   gtk_window_set_child(w.window, root)
