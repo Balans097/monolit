@@ -4,7 +4,14 @@
 `vid.stab` (`vidstabdetect` → `vidstabtransform`) поверх FFmpeg.
 
 Подробное описание возможностей, интерфейса и обоснование архитектурных
-решений — см. [manual.md](./manual.md).
+решений — см. [manual.md](./docs/manual.md).
+
+
+
+## Графический интерфейс
+
+![How it looks on Fedora Linux](./images/Screenshot_1.png)
+
 
 ## Технический стек
 
@@ -75,6 +82,4 @@ nim c -d:release --threads:on --os:windows Monolit.nim
 вызова функций, оформление блоков объявлений, группировка импортов) —
 см. [manual.md](./docs/manual.md#стиль-кода).
 
-## Лицензия / скриншот
 
-![How it looks on Fedora Linux](./images/Screenshot_1.png)
