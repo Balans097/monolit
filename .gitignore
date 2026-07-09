@@ -4,3 +4,10 @@
 *.tmp
 *.bak
 *.a
+dav1d_build/
+dav1d_build_windows/
+ffmpeg_build/
+ffmpeg_build_windows/
+vidstab_build/
+vidstab_build_windows/
+x264_build_windows/
