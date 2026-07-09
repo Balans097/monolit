@@ -210,17 +210,13 @@ proc newBoldCheckButton(ru, en: string): ptr GtkWidget =
   let lbl = newBoldLabel(ru, en)
   gtk_check_button_set_child(cast[ptr GtkCheckButton](result), lbl)
 
-proc newBoldButton(ru, en: string): ptr GtkWidget =
-  result = gtk_button_new()
-  let lbl = newBoldLabel(ru, en)
-  gtk_button_set_child(cast[ptr GtkButton](result), lbl)
-
 proc newCheckButton(ru, en: string): ptr GtkWidget =
   ## Обычный (не полужирный) чекбокс со встроенной GTK-подписью — в
   ## отличие от newBoldCheckButton, здесь подпись хранится самим GTK
   ## (gtk_check_button_set_label), а не отдельным Label-child.
-  result = gtk_check_button_new()
-  registerTr(proc () = gtk_check_button_set_label(cast[ptr GtkCheckButton](result), cstring(tr(ru, en))))
+  let btn = gtk_check_button_new()
+  registerTr(proc () = gtk_check_button_set_label(cast[ptr GtkCheckButton](btn), cstring(tr(ru, en))))
+  result = btn
 
 proc newPage(tabTitleRu, tabTitleEn: string; notebook: ptr GtkNotebook): ptr GtkBox =
   let page = gtk_box_new(GTK_ORIENTATION_VERTICAL, cint(8))
