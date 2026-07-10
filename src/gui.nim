@@ -455,17 +455,23 @@ proc buildStabTab(notebook: ptr GtkNotebook) =
 # ------------------------------------------------------------------------------
 # Вкладка «Резкость»
 # ------------------------------------------------------------------------------
-# Три чекбокса-фильтра (Smart Blur/unsharp/CAS) взаимно исключают друг
-# друга — см. пояснение в buildSharpenTab ниже. Один обработчик подключён
-# сразу к "toggled" всех трёх; при включении любого из них он гасит два
-# остальных, а при выключении (галочку сняли) ничего не трогает — так
-# допустимо состояние "все три выключены" (резкость не применяется вовсе).
-proc onFilterToggled(cb: ptr GtkCheckButton; userData: pointer) {.cdecl.} =
+# Два чекбокса-фильтра резкости (unsharp/CAS) взаимно исключают друг
+# друга — см. пояснение в buildSharpenTab ниже. Smart Blur — НЕЗАВИСИМЫЙ
+# denoise/softening-фильтр: в реальном filter chain (buildTransformFilterDesc
+# в stabilizer.nim) он всегда ставится ПЕРЕД unsharp/cas и может применяться
+# одновременно с любым из них (шумоподавление до резкости — обычная и
+# осмысленная комбинация, а не взаимоисключающая альтернатива). Раньше
+# один обработчик гасил все три чекбокса разом, из-за чего Smart Blur
+# нельзя было включить вместе с unsharp или cas, хотя пайплайн и
+# документация (manual.md) описывают его как независимый (см. F-13
+# аудита). Поэтому здесь два отдельных обработчика: onSharpenExclusiveToggled
+# трогает только unsharp/cas, а Smart Blur переключается сам по себе без
+# побочных эффектов на другие чекбоксы.
+proc onSharpenExclusiveToggled(cb: ptr GtkCheckButton; userData: pointer) {.cdecl.} =
   if gtk_check_button_get_active(cb) == 0:
     return
-  if cb != w.smartblurEnabled: gtk_check_button_set_active(w.smartblurEnabled, cint(0))
-  if cb != w.sharpenEnabled:   gtk_check_button_set_active(w.sharpenEnabled, cint(0))
-  if cb != w.casEnabled:       gtk_check_button_set_active(w.casEnabled, cint(0))
+  if cb != w.sharpenEnabled: gtk_check_button_set_active(w.sharpenEnabled, cint(0))
+  if cb != w.casEnabled:     gtk_check_button_set_active(w.casEnabled, cint(0))
 
 proc buildSharpenTab(notebook: ptr GtkNotebook) =
   let page = newPage("Резкость", "Sharpness", notebook)
@@ -511,30 +517,31 @@ proc buildSharpenTab(notebook: ptr GtkNotebook) =
   # всего «звенит» на контрастных краях (см. заметку ниже), поэтому это
   # наиболее безопасный/качественный выбор "из коробки". Устанавливаем
   # активным ДО connect(...) ниже, чтобы не спровоцировать одноразовый
-  # холостой вызов onFilterToggled при старте.
+  # холостой вызов onSharpenExclusiveToggled при старте.
   gtk_check_button_set_active(cast[ptr GtkCheckButton](casChk), cint(1))
   gtk_box_append(page, casChk)
 
   w.casStrength = newScaleRow(page, "Сила (strength)", "Strength", 0.0, 1.0, 0.05, 0.7, 2)
 
-  # Три фильтра исключают друг друга: одновременное включение двух-трёх из
-  # них, по всей видимости, лишено смысла (каждый по-своему борется с
-  # резкостью/шумом кадра, и их эффекты только мешали бы друг другу).
-  # Поэтому включение любого из трёх сразу выключает два других — см.
-  # onFilterToggled, подключённый ниже одним обработчиком на все три.
-  connect(cast[pointer](sbChk),   "toggled", onFilterToggled)
-  connect(cast[pointer](chk),     "toggled", onFilterToggled)
-  connect(cast[pointer](casChk),  "toggled", onFilterToggled)
+  # unsharp и cas исключают друг друга: одновременное включение обоих,
+  # по всей видимости, лишено смысла (оба борются за резкость кадра
+  # по-разному, и их эффекты только мешали бы друг другу). Smart Blur
+  # решает другую задачу (шумоподавление ДО резкости) и включается
+  # независимо от них — см. пояснение у onSharpenExclusiveToggled выше.
+  connect(cast[pointer](chk),     "toggled", onSharpenExclusiveToggled)
+  connect(cast[pointer](casChk),  "toggled", onSharpenExclusiveToggled)
 
   let note = newItalicLabel(
     "Резкость (unsharp/cas) применяется ПОСЛЕ стабилизации/зума — иначе\n" &
-    "усиливаются артефакты исходной тряски вместо деталей кадра. Включить\n" &
-    "можно только один из трёх фильтров — cas меньше «звенит» на\n" &
-    "контрастных краях, чем классический unsharp.",
+    "усиливаются артефакты исходной тряски вместо деталей кадра. Из этих\n" &
+    "двух можно включить только один — cas меньше «звенит» на контрастных\n" &
+    "краях, чем классический unsharp. Smart Blur независим и может быть\n" &
+    "включён одновременно с любым из них.",
     "Sharpening (unsharp/cas) is applied AFTER stabilization/zoom — otherwise\n" &
-    "it amplifies shake artifacts instead of frame detail. Only one of the\n" &
-    "three filters can be enabled at a time — cas \"rings\" less on high-\n" &
-    "contrast edges than classic unsharp.")
+    "it amplifies shake artifacts instead of frame detail. Only one of these\n" &
+    "two can be enabled at a time — cas \"rings\" less on high-contrast edges\n" &
+    "than classic unsharp. Smart Blur is independent and can be enabled\n" &
+    "together with either of them.")
   gtk_widget_set_margin_top(note, cint(6))
   gtk_box_append(page, note)
 

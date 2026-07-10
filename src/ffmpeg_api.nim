@@ -125,10 +125,16 @@ const
   AVFMT_GLOBALHEADER*          = 0x0040
 
   # Флаги двухпроходного кодирования (см. libavcodec/avcodec.h):
-  # PASS1 — первый проход собирает статистику x264 в encCtx.stats_out
-  # (кодированные данные при этом отбрасываются, никуда не пишутся);
-  # PASS2 — второй проход читает эту статистику из encCtx.stats_in и
-  # распределяет битрейт по всему ролику куда точнее, чем однопроходный ABR.
+  # PASS1 включает x264_param_t.rc.b_stat_write, PASS2 — b_stat_read.
+  # ВАЖНО (см. F-06 аудита в stabilizer.nim): для libx264 эти флаги НЕ
+  # означают обмен статистикой через generic-поля AVCodecContext.stats_out/
+  # stats_in ниже — сама обёртка libx264.c в современном FFmpeg (7.x) их
+  # для two-pass не читает и не заполняет. Статистика реально идёт через
+  # файл, заданный приватной опцией энкодера "stats" (options-словарь
+  # avcodec_open2, НЕ AVCodecContext.stats_in/out). Поля stats_out/stats_in
+  # остаются в биндинге как есть — они часть системного ABI AVCodecContext
+  # и используются некоторыми другими encoders (например, некоторыми
+  # версиями libvpx/libaom), но НЕ используйте их для libx264 two-pass.
   AV_CODEC_FLAG_PASS1* = 1 shl 9
   AV_CODEC_FLAG_PASS2* = 1 shl 10
 

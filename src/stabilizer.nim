@@ -36,7 +36,7 @@
 #    есть" (stream copy), как в PMI/concat.nim.
 # ==============================================================================
 
-import std/[strformat, strutils, os]
+import std/[strformat, strutils, os, times, locks]
 import ffmpeg_api
 
 # ------------------------------------------------------------------------------
@@ -184,36 +184,60 @@ type
 
 var progress: ptr ProgressState
 
+# ВАЖНО (F-02 из аудита): allocShared делает память ДОСТУПНОЙ обоим
+# потокам, но сама по себе НЕ делает обращения к ней атомарными или
+# упорядоченными. Раньше GTK-поток читал phase/framesDone/framesTotal/
+# errBuf, пока фоновый поток независимо их писал — формально это race
+# на C-уровне (сгенерированный код не даёт гарантий ни атомарности
+# 64-битных счётчиков на всех целях, ни порядка видимости записей).
+# Наблюдаемые последствия: GTK мог увидеть новую фазу со старыми
+# счётчиками, а setError выставлял phaseError раньше, чем errLen/errBuf
+# были заполнены, из-за чего сообщение могло быть пустым или обрезанным
+# посередине. Простое и надёжное решение — один Lock вокруг ВСЕХ чтений
+# и записей состояния; при частоте опроса раз в 200мс (см. Monolit.nim)
+# накладные расходы блокировки полностью незаметны.
+var progressLock: Lock
+initLock(progressLock)
+
 proc initStabProgress*() =
-  if progress != nil: deallocShared(progress)
-  progress = cast[ptr ProgressState](allocShared0(sizeof(ProgressState)))
-  progress.phase = phaseIdle
+  withLock progressLock:
+    if progress != nil: deallocShared(progress)
+    progress = cast[ptr ProgressState](allocShared0(sizeof(ProgressState)))
+    progress.phase = phaseIdle
 
 proc freeStabProgress*() =
-  if progress != nil:
-    deallocShared(progress)
-    progress = nil
+  withLock progressLock:
+    if progress != nil:
+      deallocShared(progress)
+      progress = nil
 
 proc getStabProgress*(): (StabPhase, int64, int64, string) {.gcsafe.} =
-  if progress == nil: return (phaseIdle, 0'i64, 0'i64, "")
-  var msg = newString(progress.errLen)
-  for i in 0 ..< progress.errLen: msg[i] = progress.errBuf[i]
-  result = (progress.phase, progress.framesDone, progress.framesTotal, msg)
+  withLock progressLock:
+    if progress == nil: return (phaseIdle, 0'i64, 0'i64, "")
+    var msg = newString(progress.errLen)
+    for i in 0 ..< progress.errLen: msg[i] = progress.errBuf[i]
+    result = (progress.phase, progress.framesDone, progress.framesTotal, msg)
 
 proc setPhase(p: StabPhase; total: int64 = 0) {.gcsafe.} =
-  if progress == nil: return
-  progress.phase = p
-  progress.framesDone = 0
-  if total > 0: progress.framesTotal = total
+  withLock progressLock:
+    if progress == nil: return
+    progress.phase = p
+    progress.framesDone = 0
+    if total > 0: progress.framesTotal = total
 
 proc bumpProgress() {.inline, gcsafe.} =
-  if progress != nil: inc progress.framesDone
+  withLock progressLock:
+    if progress != nil: inc progress.framesDone
 
 proc setError(msg: string) {.gcsafe.} =
-  if progress == nil: return
-  progress.phase = phaseError
-  progress.errLen = min(len(msg), ERR_BUF_LEN - 1)
-  for i in 0 ..< progress.errLen: progress.errBuf[i] = msg[i]
+  withLock progressLock:
+    if progress == nil: return
+    # Сообщение заполняется ДО публикации phaseError — под тем же
+    # локом, что и чтение в getStabProgress, поэтому читатель никогда
+    # не увидит phaseError с пустым/частично записанным errBuf.
+    progress.errLen = min(len(msg), ERR_BUF_LEN - 1)
+    for i in 0 ..< progress.errLen: progress.errBuf[i] = msg[i]
+    progress.phase = phaseError
 
 proc requestCancel*() {.gcsafe.} =
   ## Вызывается из GTK-потока по клику на «Стоп». Сам фоновый поток
@@ -221,17 +245,56 @@ proc requestCancel*() {.gcsafe.} =
   ## isCancelRequested() между пакетами (см. оба цикла чтения ниже),
   ## чтобы гарантированно выйти из декодера/фильтра/энкодера аккуратно,
   ## а не оборвать процесс на полуслове.
-  if progress != nil: progress.cancelRequested = true
+  withLock progressLock:
+    if progress != nil: progress.cancelRequested = true
 
 proc isCancelRequested(): bool {.inline, gcsafe.} =
-  progress != nil and progress.cancelRequested
+  withLock progressLock:
+    result = progress != nil and progress.cancelRequested
 
 # ------------------------------------------------------------------------------
 # Общие мелочи для обоих проходов
 # ------------------------------------------------------------------------------
-proc transformFilePath(cfg: StabConfig): string =
+
+proc newJobId(): string =
+  ## Уникальный суффикс для временных файлов одного запуска стабилизации
+  ## (F-10 из аудита). Раньше .trf-файл всегда назывался одинаково
+  ## ("monolit_transforms.trf"), поэтому два параллельных запуска (два
+  ## окна, два процесса, повторный запуск после сбоя) писали и читали
+  ## один и тот же файл в общем системном /tmp — гонка, чужая
+  ## траектория движения камеры или чтение недописанного файла. PID
+  ## отличает разные процессы, доля секунды — разные job в пределах
+  ## одного процесса (повторные запуски одного окна).
+  $getCurrentProcessId() & "_" & $int64(epochTime() * 1_000_000)
+
+proc transformFilePath(cfg: StabConfig; jobId: string): string =
   let dir = if len(cfg.tempDir) > 0: cfg.tempDir else: getTempDir()
-  dir / "monolit_transforms.trf"
+  dir / ("monolit_transforms_" & jobId & ".trf")
+
+proc x264PasslogPath(cfg: StabConfig; jobId: string): string =
+  ## Путь к статистике x264 two-pass (см. F-06 ниже) — по тем же
+  ## причинам, что и .trf, должен быть уникален на job, а не общим
+  ## "x264_2pass.log" в текущей рабочей директории.
+  let dir = if len(cfg.tempDir) > 0: cfg.tempDir else: getTempDir()
+  dir / ("monolit_x264_2pass_" & jobId & ".log")
+
+proc escapeFilterValue(s: string): string =
+  ## Экранирование значения опции FFmpeg-фильтра для встраивания в
+  ## текстовый filtergraph (F-01 из аудита). Раньше пути (result=/
+  ## input=) подставлялись в filterDesc без всякого экранирования;
+  ## обычный путь Windows вида "C:\Users\name\...\monolit_transforms.trf"
+  ## содержит двоеточие (разделитель опций) и обратные косые черты
+  ## (escape-символ FFmpeg), поэтому ломал разбор графа — а на Unix то
+  ## же самое происходило при двоеточии/запятой/кавычке в TMPDIR или в
+  ## пользовательском tempDir. Правило (см. "Notes on filtergraph
+  ## escaping" в документации FFmpeg): каждый спецсимвол значения
+  ## опции экранируется одиночным предшествующим '\', что действует
+  ## одинаково на всех уровнях разбора графа.
+  result = newStringOfCap(len(s))
+  for c in s:
+    if c in {'\\', '\'', ':', ',', ';', '[', ']'}:
+      result.add('\\')
+    result.add(c)
 
 {.emit: """
 /* monolit_sw_only_get_format — см. openDecoderFor в этом же файле (.nim).
@@ -365,7 +428,7 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
   # shakiness/accuracy/stepsize/mincontrast — см. описание в StabConfig;
   # значения по умолчанию (10/15/6/0.3) соответствуют "наивысшему
   # качеству анализа" из требований, ценой самой медленной обработки.
-  let filterDesc = fmt"vidstabdetect=result={trfPath}" &
+  let filterDesc = fmt"vidstabdetect=result={escapeFilterValue(trfPath)}" &
                    fmt":shakiness={cfg.shakiness}:accuracy={cfg.accuracy}" &
                    fmt":stepsize={cfg.stepsize}:mincontrast={cfg.mincontrast:.3f}"
   writeLine(stderr, "[Monolit] Проход 1 (vidstabdetect): " & filterDesc)
@@ -450,7 +513,7 @@ proc buildTransformFilterDesc(cfg: StabConfig; trfPath: string): string =
   # "keep" — дотягивать картинку с предыдущего кадра по краям,
   # "black" — честные чёрные поля там, где кадр после компенсации
   # сдвига/зума не покрывает исходный размер.
-  result = fmt"vidstabtransform=input={trfPath}" &
+  result = fmt"vidstabtransform=input={escapeFilterValue(trfPath)}" &
            fmt":smoothing={cfg.smoothing}" &
            fmt":optzoom={cfg.optzoom}" &
            fmt":zoom={cfg.zoom:.2f}" &
@@ -480,18 +543,27 @@ proc buildTransformFilterDesc(cfg: StabConfig; trfPath: string): string =
   result &= ",format=pix_fmts=yuv420p"
 
 proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
-                       passNum: int = 0; statsIn: string = ""): string =
+                       passNum: int = 0; passlogPath: string = "") =
   ## Проход 2 (компенсация + кодирование). Поведение зависит от passNum:
   ##   0 — обычный однопроходный режим (emCRF): полноценный вывод сразу.
   ##   1 — 1-й проход emBitrate2Pass: только сбор статистики x264 для
   ##       заданного целевого битрейта; кодированные кадры НИКУДА не
   ##       пишутся (нет ни выходного контейнера, ни копирования
-  ##       аудио/субтитров — они не нужны для статистики). Возвращает
-  ##       накопленную статистику (encCtx.stats_out), которую нужно
-  ##       передать вторым проходом через statsIn.
+  ##       аудио/субтитров — они не нужны для статистики).
   ##   2 — 2-й проход emBitrate2Pass: полноценный вывод, распределяющий
   ##       битрейт по всему ролику на основе статистики из прохода 1.
-  result = ""
+  ##
+  ## F-06 из аудита: статистика x264 two-pass НЕ проходит через
+  ## AVCodecContext.stats_out/stats_in — обёртка libx264 в современном
+  ## FFmpeg (7.x) эти generic-поля для своего two-pass не читает и не
+  ## заполняет; она использует ТОЛЬКО x264_param_t.rc.b_stat_write/read
+  ## и файл, заданный приватной опцией энкодера "stats" (по умолчанию
+  ## "x264_2pass.log" в текущей рабочей директории). Раньше код полагал
+  ## обратное: собирал encCtx.stats_out в statsAccum и передавал его
+  ## через encCtx.stats_in — на практике statsAccum обычно оставался
+  ## пуст, а реальный обмен статистикой шёл через побочный файл в cwd,
+  ## общий для двух параллельных job. Теперь передаём явный уникальный
+  ## passlogPath через опцию "stats" в обоих проходах.
   let statsOnlyPass = (passNum == 1)   # true только для сбора статистики (без вывода)
 
   var inFmt: ptr AVFormatContext
@@ -584,10 +656,12 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
       encCtx.flags = encCtx.flags or AV_CODEC_FLAG_PASS1
     elif passNum == 2:
       encCtx.flags = encCtx.flags or AV_CODEC_FLAG_PASS2
-      # statsIn должен пережить весь проход кодирования — он живёт как
-      # параметр этой функции, поэтому указатель остаётся валидным до
-      # самого её завершения (avcodec_free_context ниже, через defer).
-      encCtx.stats_in = cstring(statsIn)
+    if passNum in {1, 2}:
+      # "stats" — приватная опция libx264-обёртки FFmpeg, задающая
+      # x264_param_t.rc.psz_stat_out/psz_stat_in; ОБА прохода должны
+      # получить один и тот же (уникальный на job) путь, иначе проход 2
+      # не найдёт статистику прохода 1 (см. пояснение F-06 выше).
+      discard av_dict_set(addr encOpts, "stats", cstring(passlogPath), 0)
   ffCheck(avcodec_open2(encCtx, encoder, addr encOpts), "avcodec_open2 x264")
   av_dict_free(addr encOpts)
   defer: avcodec_free_context(addr encCtx)
@@ -667,7 +741,6 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   var
     tmpPkt = av_packet_alloc()
     ptsCounter: int64 = 0
-    statsAccum = ""   # накопитель статистики x264 — заполняется только на statsOnlyPass
 
   proc drainPackets() =
     ## Слить все готовые пакеты из энкодера. Вынесено в отдельную функцию,
@@ -679,10 +752,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
       if rp == AVERROR_EAGAIN or rp == AVERROR_EOF: break
       if rp < 0: break
       if statsOnlyPass:
-        # Кодированные данные тут не нужны — важна только статистика,
-        # которую x264 после каждого пакета кладёт в encCtx.stats_out.
-        if encCtx.stats_out != nil:
-          add(statsAccum, $encCtx.stats_out)
+        discard # статистика x264 идёт в passlogPath-файл, эти пакеты не нужны
       else:
         tmpPkt.stream_index = outVidStream.index
         av_packet_rescale_ts(tmpPkt, encCtx.time_base, outVidStream.time_base)
@@ -790,15 +860,15 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   if not statsOnlyPass:
     ffCheck(av_write_trailer(outFmt), "write_trailer")
 
-  result = statsAccum
-
 # ------------------------------------------------------------------------------
 # Публичная точка входа — вызывается из фонового потока Monolit.nim
 # ------------------------------------------------------------------------------
 proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
   let
     threads = if cpuThreads > 0: cpuThreads else: max(1, int(av_cpu_count()))
-    trfPath = transformFilePath(cfg)
+    jobId = newJobId()
+    trfPath = transformFilePath(cfg, jobId)
+    passlogPath = x264PasslogPath(cfg, jobId)
   writeLine(stderr,
     "[Monolit] Старт: \"" & cfg.inputFile & "\" -> \"" & cfg.outputFile & "\" " &
     "(потоков: " & $threads & ", .trf: " & trfPath & ")")
@@ -815,13 +885,14 @@ proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
     runDetectPass(cfg, trfPath, threads)
     case cfg.encodeMode
     of emCRF:
-      discard runTransformPass(cfg, trfPath, threads, passNum = 0)
+      runTransformPass(cfg, trfPath, threads, passNum = 0)
     of emBitrate2Pass:
-      # Проход A — только статистика x264 (ничего не пишется на диск, кроме .trf).
-      let stats = runTransformPass(cfg, trfPath, threads, passNum = 1)
-      # Проход B — реальный вывод, битрейт распределяется по всему ролику
-      # на основе статистики, собранной проходом A.
-      discard runTransformPass(cfg, trfPath, threads, passNum = 2, statsIn = stats)
+      # Проход A — только статистика x264, накапливаемая в passlogPath
+      # (ничего не пишется на диск, кроме .trf и passlog).
+      runTransformPass(cfg, trfPath, threads, passNum = 1, passlogPath = passlogPath)
+      # Проход B — реальный вывод; libx264 сам читает ту же passlogPath
+      # и распределяет битрейт по всему ролику на основе прохода A.
+      runTransformPass(cfg, trfPath, threads, passNum = 2, passlogPath = passlogPath)
     writeLine(stderr, "[Monolit] Готово: \"" & cfg.outputFile & "\"")
     flushFile(stderr)
     setPhase(phaseDone)
@@ -839,7 +910,24 @@ proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
     flushFile(stderr)
     setError(e.msg)
   finally:
-    if fileExists(trfPath) and len(cfg.tempDir) == 0:
-      # transforms.trf во временной папке ОС — подчищаем; если пользователь
-      # явно указал tempDir (например, для отладки), файл оставляем.
+    # Раньше подчистка временных файлов job'а была обусловлена
+    # "len(cfg.tempDir) == 0", в расчёте на то, что непустой tempDir
+    # означает "пользователь просит debug-режим — оставить файлы". На
+    # практике gui.nim ВСЕГДА заполняет cfg.tempDir=getTempDir() (см.
+    # collectConfig), поэтому это условие было ложным на каждом
+    # обычном запуске из GUI, и .trf/passlog никогда не удалялись —
+    # именно это и описывает F-10 аудита ("обычная GUI-операция
+    # оставляет файл навсегда"). Отдельного флага "сохранить debug
+    # artifacts" в проекте нет, поэтому подчищаем всегда; имена
+    # уникальны на job (см. newJobId), так что это безопасно даже при
+    # нескольких параллельно работающих окнах/процессах.
+    if fileExists(trfPath):
       try: removeFile(trfPath) except OSError: discard
+    # x264 two-pass помимо основного лога оставляет "<log>.temp" (на
+    # время записи) и "<log>.mbtree"/"<log>.mbtree.temp" (статистика
+    # mb-tree, если она включена в пресете) — подчищаем всё семейство.
+    if fileExists(passlogPath):
+      try: removeFile(passlogPath) except OSError: discard
+    for suffix in [".temp", ".mbtree", ".mbtree.temp"]:
+      if fileExists(passlogPath & suffix):
+        try: removeFile(passlogPath & suffix) except OSError: discard
