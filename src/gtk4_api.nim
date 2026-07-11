@@ -128,6 +128,11 @@ proc g_application_run*(app: ptr GApplication; argc: cint; argv: ptr cstring): c
   {.importc: "g_application_run", header: "<gio/gio.h>".}
 proc g_object_unref*(obj: pointer)
   {.importc: "g_object_unref", header: "<glib-object.h>".}
+proc g_free*(mem: pointer)
+  {.importc: "g_free", header: "<glib.h>".}
+  ## Освобождает память, выделенную GLib/GObject API (g_file_get_path,
+  ## g_strdup и т.п.) — см. F-23 из аудита: раньше строки, возвращаемые
+  ## g_file_get_path, никогда не освобождались.
 
 # g_signal_connect() в C — макрос над g_signal_connect_data(); импортируем
 # саму функцию и оборачиваем шаблоном, чтобы не тащить varargs-магию сюда.
@@ -417,6 +422,11 @@ proc newDropDown*(items: openArray[string]): ptr GtkWidget =
   connect(cast[pointer](factory), "setup", onDropdownItemSetup)
   connect(cast[pointer](factory), "bind", onDropdownItemBind)
   gtk_drop_down_set_factory(cast[ptr GtkDropDown](result), factory)
+  # gtk_signal_list_item_factory_new() возвращает caller-owned ссылку;
+  # gtk_drop_down_set_factory забирает СВОЮ собственную ссылку на factory,
+  # поэтому нашу исходную нужно снять — иначе она утекает на каждый
+  # newDropDown (F-23 из аудита).
+  g_object_unref(cast[pointer](factory))
 
 # ------------------------------------------------------------------------------
 # ProgressBar
@@ -474,6 +484,13 @@ proc g_idle_add*(function: GSourceFunc; data: pointer): cuint
   {.importc: "g_idle_add", header: "<glib.h>".}
 
 const G_SOURCE_REMOVE* = cint(0)  # возврат из GSourceFunc: не вызывать повторно
+
+proc g_source_remove*(tag: cuint): cint
+  {.importc: "g_source_remove", header: "<glib.h>".}
+  ## Снимает источник (таймер/idle) по id, возвращённому g_timeout_add/
+  ## g_idle_add — используется при закрытии окна, чтобы таймер прогресса
+  ## не сработал уже после того, как виджеты уничтожены/заменены (F-08
+  ## из аудита).
 
 # ------------------------------------------------------------------------------
 # locale.h — принудительный возврат LC_NUMERIC в "C" после инициализации GTK

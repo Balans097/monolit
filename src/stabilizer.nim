@@ -278,6 +278,58 @@ proc x264PasslogPath(cfg: StabConfig; jobId: string): string =
   let dir = if len(cfg.tempDir) > 0: cfg.tempDir else: getTempDir()
   dir / ("monolit_x264_2pass_" & jobId & ".log")
 
+proc tempOutputPath(cfg: StabConfig; jobId: string): string =
+  ## F-03 из аудита: раньше муксер писал НЕПОСРЕДСТВЕННО в cfg.outputFile —
+  ## ошибка посреди кодирования или отмена оставляли частично записанный,
+  ## физически повреждённый файл под финальным именем, а уже существующий
+  ## на этом месте результат стирался ДО подтверждённого успеха
+  ## (avio_open открывает конечный путь на запись сразу). Теперь пишем во
+  ## временный файл РЯДОМ с конечным (тот же каталог => тот же filesystem
+  ## => переименование ниже атомарно), с тем же расширением в конце (иначе
+  ## avformat_alloc_output_context2 не опознает контейнер по расширению) —
+  ## и переименовываем в cfg.outputFile только после успешного закрытия.
+  let (dir, name, ext) = splitFile(cfg.outputFile)
+  let baseDir = if len(dir) > 0: dir else: "."
+  baseDir / (name & ".monolit_tmp_" & jobId & ext)
+
+proc validateJobPaths(cfg: StabConfig) =
+  ## Preflight-проверки (F-03/F-20 из аудита), выполняемые ДО тяжёлой
+  ## работы (vidstabdetect и, тем более, до 2-pass кодирования) — раньше
+  ## многие из этих проблем всплывали только после avio_open/write_header
+  ## в конце самого дорогого прохода.
+  if len(cfg.inputFile) == 0 or not fileExists(cfg.inputFile):
+    raise newException(IOError, "входной файл не найден: " & cfg.inputFile)
+  if len(cfg.outputFile) == 0:
+    raise newException(IOError, "не указан выходной файл")
+
+  # Сравнение input/output — не только по строке пути (относительные пути,
+  # "." vs полный путь и т.п.), но и по факту, что это один и тот же файл
+  # на диске (в т.ч. через hardlink/иной нормализованный путь), если оба
+  # уже существуют.
+  let absIn  = try: expandFilename(cfg.inputFile) except OSError: absolutePath(cfg.inputFile)
+  let absOut = try: expandFilename(cfg.outputFile) except OSError: absolutePath(cfg.outputFile)
+  var sameTarget = absIn == absOut
+  if not sameTarget and fileExists(cfg.outputFile):
+    sameTarget = try: sameFile(cfg.inputFile, cfg.outputFile) except OSError: false
+  if sameTarget:
+    raise newException(IOError,
+      "выходной файл совпадает с входным — обработка перезаписала бы " &
+      "исходное видео прямо во время чтения; выберите другой путь для результата")
+
+  # Каталог назначения должен существовать и быть доступен для записи —
+  # проверяем ДО детект-прохода, создавая и сразу удаляя пробный файл,
+  # а не выясняя это только на avio_open в конце обработки.
+  let (outDirRaw, _, _) = splitFile(absOut)
+  let outDir = if len(outDirRaw) > 0: outDirRaw else: "."
+  if not dirExists(outDir):
+    raise newException(IOError, "каталог назначения не существует: " & outDir)
+  let probePath = outDir / (".monolit_write_probe_" & $getCurrentProcessId())
+  try:
+    writeFile(probePath, "")
+    removeFile(probePath)
+  except OSError:
+    raise newException(IOError, "нет прав на запись в каталог назначения: " & outDir)
+
 proc escapeFilterValue(s: string): string =
   ## Экранирование значения опции FFmpeg-фильтра для встраивания в
   ## текстовый filtergraph (F-01 из аудита). Раньше пути (result=/
@@ -330,6 +382,19 @@ static enum AVPixelFormat monolit_sw_only_get_format(struct AVCodecContext *ctx,
   return fmts[0];  /* ничего программного не нашли — отдаём то, что предложили первым */
 }
 """.}
+
+proc decoderThreadCount(totalThreads: int): int =
+  ## F-19 из аудита: раньше и декодер, и энкодер получали ПОЛНОЕ число
+  ## обнаруженных ядер (thread_count = threads) НЕЗАВИСИМО друг от друга,
+  ## хотя работают одновременно в одном и том же проходе (декодер отдаёт
+  ## кадры фильтру/энкодеру по мере готовности) — на N-ядерной машине это
+  ## до 2×N запрошенных потоков сразу. Декодирование H.264/HEVC/AV1 почти
+  ## всегда заметно дешевле, чем vidstab-фильтрация + x264-кодирование,
+  ## поэтому забирать у энкодера половину ядер под декодер не имеет
+  ## смысла — отдаём декодеру заведомо меньшую долю, а всё "настоящее"
+  ## параллельство отдаём энкодеру (encCtx.thread_count = threads, без
+  ## изменений).
+  max(1, min(totalThreads, 4))
 
 proc openDecoderFor(fmtCtx: ptr AVFormatContext; streamIdx: cint;
                      threads: int): ptr AVCodecContext =
@@ -391,7 +456,7 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
 
   setPhase(phaseAnalyze, estimateFrameCount(fmtCtx, cint(vidIdx)))
 
-  var decCtx = openDecoderFor(fmtCtx, cint(vidIdx), threads)
+  var decCtx = openDecoderFor(fmtCtx, cint(vidIdx), decoderThreadCount(threads))
   defer: avcodec_free_context(addr decCtx)
 
   let stream = fmtCtx.streams[vidIdx]
@@ -413,10 +478,18 @@ proc runDetectPass(cfg: StabConfig; trfPath: string; threads: int) =
   let
     tb = stream.time_base
     fr = getStreamFpsRat(stream)
+    # F-12 из аудита: раньше здесь был безусловный pixel_aspect=1/1, тогда
+    # как энкодер (см. runTransformPass) использует реальный
+    # decCtx.sample_aspect_ratio — несогласованность между тем, что видит
+    # фильтрграф, и тем, что в итоге пишется в поток. 0/1 или 0/0 означает
+    # "SAR неизвестен" — в этом случае честный fallback 1/1 (квадратный
+    # пиксель), иначе передаём фактическое значение декодера.
+    sar = decCtx.sample_aspect_ratio
+    sarStr = if sar.num > 0 and sar.den > 0: fmt"{sar.num}/{sar.den}" else: "1/1"
     srcArgs = fmt"video_size={decCtx.width}x{decCtx.height}" &
               fmt":pix_fmt={cint(decCtx.pix_fmt)}" &
               fmt":time_base={tb.num}/{tb.den}" &
-              fmt":pixel_aspect=1/1:frame_rate={fr.num}/{fr.den}"
+              fmt":pixel_aspect={sarStr}:frame_rate={fr.num}/{fr.den}"
 
   var srcCtx, sinkCtx: ptr AVFilterContext
   ffCheck(avfilter_graph_create_filter(addr srcCtx, bufFilt, "in",
@@ -543,7 +616,8 @@ proc buildTransformFilterDesc(cfg: StabConfig; trfPath: string): string =
   result &= ",format=pix_fmts=yuv420p"
 
 proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
-                       passNum: int = 0; passlogPath: string = "") =
+                       passNum: int = 0; passlogPath: string = "";
+                       outputWritePath: string = "") =
   ## Проход 2 (компенсация + кодирование). Поведение зависит от passNum:
   ##   0 — обычный однопроходный режим (emCRF): полноценный вывод сразу.
   ##   1 — 1-й проход emBitrate2Pass: только сбор статистики x264 для
@@ -583,7 +657,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   else:
     setPhase(phaseTransform, estimateFrameCount(inFmt, cint(vidIdx)))
 
-  var decCtx = openDecoderFor(inFmt, cint(vidIdx), threads)
+  var decCtx = openDecoderFor(inFmt, cint(vidIdx), decoderThreadCount(threads))
   defer: avcodec_free_context(addr decCtx)
   let inStream = inFmt.streams[vidIdx]
 
@@ -595,8 +669,13 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   var
     outFmt: ptr AVFormatContext = nil
     outVidStream: ptr AVStream = nil
+    # F-03 из аудита: пишем во временный файл (см. tempOutputPath), а не
+    # напрямую в cfg.outputFile — иначе ошибка/отмена/segfault посреди
+    # записи оставляет повреждённый файл под финальным именем и стирает
+    # ранее существовавший там результат ещё ДО подтверждённого успеха.
+    writePath = if len(outputWritePath) > 0: outputWritePath else: cfg.outputFile
   if not statsOnlyPass:
-    ffCheck(avformat_alloc_output_context2(addr outFmt, nil, nil, cstring(cfg.outputFile)),
+    ffCheck(avformat_alloc_output_context2(addr outFmt, nil, nil, cstring(writePath)),
             "alloc_output_context2")
     outVidStream = avformat_new_stream(outFmt, nil)
     if outVidStream == nil:
@@ -636,6 +715,18 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   encCtx.thread_count = cint(threads)
   encCtx.thread_type  = cint(FF_THREAD_FRAME or FF_THREAD_SLICE)
   encCtx.sample_aspect_ratio = decCtx.sample_aspect_ratio
+  # F-12 из аудита: раньше color_range/color_primaries/color_trc/colorspace
+  # энкодера оставались "unknown" по умолчанию независимо от исходника, из-
+  # за чего плееры могли додумывать цвет неверно (например, показать
+  # full-range видео как limited, или BT.709 контент как BT.601) — эти
+  # теги описывают ИНТЕРПРЕТАЦИЮ уже имеющихся YUV-значений и не зависят от
+  # понижения до yuv420p/8-bit ниже, поэтому их безопасно и правильно
+  # перенести как есть. Полноценный HDR-путь (tone mapping/10-bit) сюда
+  # намеренно не входит — это отдельная, более крупная задача (см. review.md).
+  encCtx.colorspace      = decCtx.colorspace
+  encCtx.color_range     = decCtx.color_range
+  encCtx.color_primaries = decCtx.color_primaries
+  encCtx.color_trc       = decCtx.color_trc
   if outFmt != nil and outFmt.oformat != nil and
      (outFmt.oformat.flags and AVFMT_GLOBALHEADER) != 0:
     encCtx.flags = encCtx.flags or AV_CODEC_FLAG_GLOBAL_HEADER
@@ -674,6 +765,20 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   # --- Аудио/субтитры/вложения: прямое копирование потоков (без перекодирования) ---
   # На статистическом проходе не нужны вообще — стрим-мапы остаются пустыми,
   # а findMap() ниже просто откинет все непопавшие в неё пакеты.
+  # F-11 из аудита: MP4/MOV не умеют произвольные Matroska-вложения
+  # (шрифты и т.п.) — раньше это приводило к ошибке avformat_write_header
+  # ТОЛЬКО после полного дорогого прохода vidstabdetect (а на emBitrate2Pass
+  # — ещё и после статистического прохода кодирования). Здесь отключаем
+  # копирование attachments для этих контейнеров заранее и один раз
+  # предупреждаем в лог, вместо того чтобы выяснять несовместимость
+  # постфактум ценой всей уже проделанной работы.
+  let outExtLower = toLowerAscii(splitFile(cfg.outputFile).ext)
+  let attachmentsUnsupported = outExtLower in [".mp4", ".m4v", ".mov"]
+  if attachmentsUnsupported and cfg.saveAttachments and not statsOnlyPass:
+    writeLine(stderr, "[Monolit] [WARN] Контейнер " & outExtLower &
+      " не поддерживает произвольные вложения (шрифты и т.п.) — вложения " &
+      "будут пропущены при копировании потоков.")
+    flushFile(stderr)
   var streamMaps: seq[StreamMap] = @[]
   if not statsOnlyPass:
     for i in 0 ..< int(inFmt.nb_streams):
@@ -684,7 +789,8 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
         keep =
           (mtype == AVMEDIA_TYPE_AUDIO      and cfg.copyAudio) or
           (mtype == AVMEDIA_TYPE_SUBTITLE   and cfg.saveSubtitles) or
-          (mtype == AVMEDIA_TYPE_ATTACHMENT and cfg.saveAttachments)
+          (mtype == AVMEDIA_TYPE_ATTACHMENT and cfg.saveAttachments and
+           not attachmentsUnsupported)
       if not keep: continue
       let outSt = avformat_new_stream(outFmt, nil)
       if outSt == nil: continue
@@ -694,7 +800,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
       outSt.time_base = st.time_base
       add(streamMaps, StreamMap(inIdx: cint(i), outIdx: outSt.index, inTB: st.time_base))
 
-    ffCheck(avio_open(addr outFmt.pb, cstring(cfg.outputFile), AVIO_FLAG_WRITE), "avio_open")
+    ffCheck(avio_open(addr outFmt.pb, cstring(writePath), AVIO_FLAG_WRITE), "avio_open")
     ffCheck(avformat_write_header(outFmt, nil), "write_header")
 
   # --- Фильтрграф прохода 2 -------------------------------------------------
@@ -708,10 +814,12 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
   let
     tb = inStream.time_base
     fr = getStreamFpsRat(inStream)
+    sar = decCtx.sample_aspect_ratio
+    sarStr = if sar.num > 0 and sar.den > 0: fmt"{sar.num}/{sar.den}" else: "1/1"
     srcArgs = fmt"video_size={decCtx.width}x{decCtx.height}" &
               fmt":pix_fmt={cint(decCtx.pix_fmt)}" &
               fmt":time_base={tb.num}/{tb.den}" &
-              fmt":pixel_aspect=1/1:frame_rate={fr.num}/{fr.den}"
+              fmt":pixel_aspect={sarStr}:frame_rate={fr.num}/{fr.den}"
 
   var srcCtx, sinkCtx: ptr AVFilterContext
   ffCheck(avfilter_graph_create_filter(addr srcCtx, bufFilt, "in",
@@ -750,14 +858,22 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
     while true:
       let rp = avcodec_receive_packet(encCtx, tmpPkt)
       if rp == AVERROR_EAGAIN or rp == AVERROR_EOF: break
-      if rp < 0: break
+      if rp < 0:
+        # F-04 из аудита: раньше ЛЮБАЯ ошибка receive_packet (не только
+        # штатные EAGAIN/EOF) молча обрывала цикл — реальный сбой энкодера
+        # выглядел как "всё готово", просто с недостающими кадрами в конце.
+        raise newException(IOError, "avcodec_receive_packet: код ошибки " & $rp)
       if statsOnlyPass:
         discard # статистика x264 идёт в passlogPath-файл, эти пакеты не нужны
       else:
         tmpPkt.stream_index = outVidStream.index
         av_packet_rescale_ts(tmpPkt, encCtx.time_base, outVidStream.time_base)
         tmpPkt.pos = -1
-        discard av_interleaved_write_frame(outFmt, tmpPkt)
+        # av_interleaved_write_frame реально может вернуть ошибку (диск
+        # переполнен, оборвался сетевой вывод и т.п.) — раньше она
+        # молча отбрасывалась, из-за чего job завершался с "Готово",
+        # хотя файл на диске оставался усечённым/повреждённым.
+        ffCheck(av_interleaved_write_frame(outFmt, tmpPkt), "av_interleaved_write_frame")
       av_packet_unref(tmpPkt)
 
   proc encodeAndWrite(frame: ptr AVFrame) =
@@ -841,7 +957,7 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
       av_packet_rescale_ts(pkt, streamMaps[mi].inTB, outSt.time_base)
       pkt.stream_index = outSt.index
       pkt.pos = -1
-      discard av_interleaved_write_frame(outFmt, pkt)
+      ffCheck(av_interleaved_write_frame(outFmt, pkt), "av_interleaved_write_frame (stream copy)")
       av_packet_unref(pkt)
 
   # flush: decoder → filter → filter(nil) → encoder(nil)
@@ -859,6 +975,18 @@ proc runTransformPass(cfg: StabConfig; trfPath: string; threads: int;
 
   if not statsOnlyPass:
     ffCheck(av_write_trailer(outFmt), "write_trailer")
+    # Закрываем и сбрасываем pb ЗАРАНЕЕ (а не полагаясь на defer выше,
+    # который выполнится только в самом конце proc) — переименовывать
+    # файл, пока он ещё открыт этим же процессом на запись, небезопасно.
+    if outFmt.pb != nil:
+      ffCheck(avio_closep(addr outFmt.pb), "avio_closep")
+    if writePath != cfg.outputFile:
+      try:
+        moveFile(writePath, cfg.outputFile)
+      except OSError as e:
+        raise newException(IOError,
+          "не удалось перенести результат из временного файла " &
+          writePath & " в " & cfg.outputFile & ": " & e.msg)
 
 # ------------------------------------------------------------------------------
 # Публичная точка входа — вызывается из фонового потока Monolit.nim
@@ -869,6 +997,7 @@ proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
     jobId = newJobId()
     trfPath = transformFilePath(cfg, jobId)
     passlogPath = x264PasslogPath(cfg, jobId)
+    outTmpPath = tempOutputPath(cfg, jobId)
   writeLine(stderr,
     "[Monolit] Старт: \"" & cfg.inputFile & "\" -> \"" & cfg.outputFile & "\" " &
     "(потоков: " & $threads & ", .trf: " & trfPath & ")")
@@ -882,34 +1011,45 @@ proc runStabilization*(cfg: StabConfig; cpuThreads: int = 0) =
     " crf=" & $cfg.crf & " битрейт=" & $cfg.videoBitrateKbps & " кбит/с")
   flushFile(stderr)
   try:
+    # F-03/F-20 из аудита: все проверки, способные провалиться "дёшево"
+    # (нет входа, вход==выход, каталог назначения недоступен для записи),
+    # выполняются здесь, ДО единственного самого дорогого прохода
+    # (vidstabdetect) — а не всплывают спустя минуты обработки на
+    # avio_open в конце.
+    validateJobPaths(cfg)
     runDetectPass(cfg, trfPath, threads)
     case cfg.encodeMode
     of emCRF:
-      runTransformPass(cfg, trfPath, threads, passNum = 0)
+      runTransformPass(cfg, trfPath, threads, passNum = 0, outputWritePath = outTmpPath)
     of emBitrate2Pass:
       # Проход A — только статистика x264, накапливаемая в passlogPath
       # (ничего не пишется на диск, кроме .trf и passlog).
       runTransformPass(cfg, trfPath, threads, passNum = 1, passlogPath = passlogPath)
       # Проход B — реальный вывод; libx264 сам читает ту же passlogPath
       # и распределяет битрейт по всему ролику на основе прохода A.
-      runTransformPass(cfg, trfPath, threads, passNum = 2, passlogPath = passlogPath)
+      runTransformPass(cfg, trfPath, threads, passNum = 2, passlogPath = passlogPath,
+                        outputWritePath = outTmpPath)
     writeLine(stderr, "[Monolit] Готово: \"" & cfg.outputFile & "\"")
     flushFile(stderr)
     setPhase(phaseDone)
   except StabCancelledError:
     writeLine(stderr, "[Monolit] Остановлено пользователем.")
     flushFile(stderr)
-    # Недописанный результат неполон (а зачастую и физически повреждён —
-    # обрыв мьюксера посреди файла), оставлять его под именем, которое
-    # пользователь может перепутать с настоящим результатом, не стоит.
-    if fileExists(cfg.outputFile):
-      try: removeFile(cfg.outputFile) except OSError: discard
     setPhase(phaseCancelled)
   except CatchableError as e:
     writeLine(stderr, "[Monolit] ОШИБКА: " & e.msg)
     flushFile(stderr)
     setError(e.msg)
   finally:
+    # F-03 из аудита: результат всегда пишется во временный файл
+    # (outTmpPath), а в cfg.outputFile переносится ТОЛЬКО целиком и
+    # успешно (см. конец runTransformPass) — поэтому при отмене/ошибке
+    # подчищать нужно именно временный файл, а не cfg.outputFile: раньше
+    # здесь удалялся сам cfg.outputFile, что при отмене могло стереть
+    # ранее существовавший на этом месте результат ещё до того, как
+    # новый успешно дописался.
+    if fileExists(outTmpPath):
+      try: removeFile(outTmpPath) except OSError: discard
     # Раньше подчистка временных файлов job'а была обусловлена
     # "len(cfg.tempDir) == 0", в расчёте на то, что непустой tempDir
     # означает "пользователь просит debug-режим — оставить файлы". На

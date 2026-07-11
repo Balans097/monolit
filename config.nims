@@ -22,10 +22,12 @@
 #    3. GTK4 линкуется ДИНАМИЧЕСКИ через pkg-config (см. обоснование в
 #       src/gtk4_api.nim) — на Windows pkg-config должен резолвить
 #       mingw64-сборку GTK4 (см. ensureMingwGtk4).
-#    4. Для Windows добавлен отдельный шаг packageWindowsDist — копирует
-#       Monolit.exe рядом с рантаймом GTK4 (DLL, share/glib-2.0/schemas,
-#       share/icons) в один раздаваемый каталог, т.к. эти файлы GTK
-#       ищет рядом с собой в рантайме, а не только на этапе линковки.
+#    4. ПРИМЕЧАНИЕ (F-29 аудита): готового шага упаковки Windows-дистрибутива
+#       (Monolit.exe + рантайм GTK4 — DLL, share/glib-2.0/schemas,
+#       share/icons — рядом в одном каталоге) в проекте СЕЙЧАС НЕТ. Такой
+#       шаг нужен, т.к. эти файлы GTK ищет рядом с собой в рантайме, а не
+#       только на этапе линковки — но реализация ниже не автоматическая:
+#       см. TODO у конца файла.
 #    5. Перед FFmpeg отдельно собирается статическая libdav1d.a (Meson-
 #       проект videolan/dav1d, не зависит от FFmpeg) и подключается через
 #       --enable-libdav1d — Monolit явно предпочитает её для AV1-потоков
@@ -48,6 +50,29 @@ proc detectJobs(): string =
   if nproc.exitCode == 0 and strip(nproc.output) != "": return strip(nproc.output)
   echo "[config.nims] [WARN] Не удалось определить число ядер, используем 4."
   return "4"
+
+# F-15 из аудита: обычная `nim c` раньше БЕЗУСЛОВНО могла обратиться к сети
+# (git clone нескольких репозиториев) и выполнить `sudo dnf install`, что
+# затрудняет CI, offline-сборки, работу в песочнице статического анализа и
+# аудит supply chain. MONOLIT_OFFLINE=1 делает оба вида побочных эффектов
+# явными ошибками остановки вместо тихого выполнения — сборка тогда
+# работает только с уже подготовленным (заранее склонированным/
+# установленным) окружением.
+let offlineMode = getEnv("MONOLIT_OFFLINE") != ""
+
+proc requireOnline(what: string) =
+  if offlineMode:
+    echo fmt"[config.nims] [ERROR] MONOLIT_OFFLINE=1, а нужно: {what}. " &
+         "Подготовьте зависимость заранее (склонируйте/установите вручную) " &
+         "и запустите сборку снова, либо снимите MONOLIT_OFFLINE."
+    quit(1)
+
+proc trySudoInstall(pkgLine: string; what: string) =
+  ## Единая точка для всех `sudo dnf install` — раньше каждый вызов сам по
+  ## себе решал, ставить ли пакеты, никак не считаясь с offline/CI-режимом.
+  requireOnline(what)
+  if findHostExe("dnf") != "":
+    exec "sudo dnf install -y " & pkgLine & " || true"
 
 let
   thisFile        = slashify(currentSourcePath())
@@ -87,6 +112,44 @@ proc allLibsExist(dir: string): bool =
   for libName in ffmpegLibs:
     if not fileExists(bp(dir, libName)): result = false
 
+proc buildStampPath(dir: string): string = bp(dir, "monolit_build_stamp.txt")
+
+proc ffmpegBuildSignature(windows: bool): string =
+  ## F-16 из аудита: готовность FFmpeg-кэша раньше определялась ТОЛЬКО
+  ## наличием шести .a — смена ветки/тега зависимости, флагов сборки или
+  ## toolchain'а в config.nims не вызывала пересборку, пока файлы
+  ## физически лежали на месте, и разработчик получал старый бинарник
+  ## молча. Подпись включает всё, что реально влияет на результат сборки;
+  ## изменение любого значения делает закэшированные .a недействительными.
+  let archFlag = if getEnv("MONOLIT_NATIVE_ARCH") != "": "native" else: "portable"
+  fmt"ffmpeg={ffmpegBranch};vidstab={vidstabTag};dav1d={dav1dTag};" &
+  fmt"windows={windows};arch={archFlag};mingwPrefix={mingwPrefix}"
+
+proc cacheIsValid(dir: string; windows: bool): bool =
+  if not allLibsExist(dir): return false
+  let stampFile = buildStampPath(dir)
+  if not fileExists(stampFile): return false
+  result = strip(readFile(stampFile)) == ffmpegBuildSignature(windows)
+
+proc isUnderCacheRoot(path: string): bool =
+  ## F-14 из аудита: раньше cloneRepo сносила ЛЮБОЙ существующий dst через
+  ## `rm -rf` без всякой проверки, что это за каталог. dst для FFmpeg может
+  ## прийти из переменной окружения PMI_FFMPEG_SRC — опечатка, случайно не
+  ## тот путь или чужой каталог, скопированный в переменную, привели бы к
+  ## удалению произвольных данных пользователя. Разрешаем destructive-очистку
+  ## только для путей, лежащих строго внутри ожидаемого dependency cache
+  ## root (parentOfProject/*) — именно туда попадают все дефолтные пути
+  ## (ffmpegSrc без override, x264Src, vidstabSrc, dav1dSrc).
+  # expandFilename() недоступен в NimScript (используется VM, а не
+  # обычный рантайм — сама config.nims выполняется just as build script,
+  # не компилируется как обычный модуль). normalizedPath(absolutePath())
+  # не резолвит симлинки, как expandFilename, но для проверки "лежит ли
+  # путь внутри cache root" этого достаточно — все дефолтные пути и так
+  # строятся через bp(parentOfProject, ...) без симлинков.
+  let canon = normalizedPath(absolutePath(path))
+  let root  = normalizedPath(absolutePath(parentOfProject))
+  result = canon == root or canon.startsWith(root & "/")
+
 proc cloneRepo(url, dst, branch: string) =
   # Раньше здесь просто вызывался git clone — если по каким-то причинам
   # каталог dst уже существует (прерванный предыдущий клон, ручной
@@ -96,11 +159,23 @@ proc cloneRepo(url, dst, branch: string) =
   # vid.stab). Раз вызывающая сторона уже решила, что клон нужен (маркер
   # отсутствует), безопаснее снести незавершённый/чужой каталог и
   # клонировать начисто, чем падать или тихо доверять непонятному
-  # содержимому.
+  # содержимому — НО только если этот каталог действительно лежит внутри
+  # dependency cache root (см. isUnderCacheRoot, F-14 аудита); иначе —
+  # остановка с понятной ошибкой вместо потенциально разрушительного rm -rf
+  # над непредвиденным путём (например, из опечатки в PMI_FFMPEG_SRC).
   if dirExists(dst):
+    if not isUnderCacheRoot(dst):
+      echo fmt"[config.nims] [ERROR] {dst} уже существует и не содержит " &
+           "ожидаемых файлов сборки, но лежит ВНЕ dependency cache root " &
+           fmt"({parentOfProject}) — на всякий случай НЕ удаляю его " &
+           "автоматически (возможно, это опечатка в переменной окружения " &
+           "вроде PMI_FFMPEG_SRC). Удалите или очистите каталог вручную и " &
+           "запустите сборку заново."
+      quit(1)
     echo fmt"[config.nims] {dst} уже существует, но без ожидаемых файлов — " &
          "удаляем и клонируем заново."
     exec "rm -rf \"" & dst & "\""
+  requireOnline(fmt"клонировать {url}")
   echo fmt"[config.nims] Клонируем {url} ({branch}) → {dst}"
   exec "git clone --branch \"" & branch & "\" --depth 1 \"" & url & "\" \"" & dst & "\""
 
@@ -111,10 +186,10 @@ proc ensureMingwToolchain(): string =
   result = findHostExe(mingwPrefix & "gcc")
   if result != "": return
   echo "[config.nims] mingw-w64 тулчейн не найден, пробуем dnf..."
-  if findHostExe("dnf") != "":
-    exec "sudo dnf install -y mingw64-gcc mingw64-gcc-c++ mingw64-binutils " &
-         "mingw64-filesystem mingw64-crt mingw64-headers " &
-         "mingw64-winpthreads-static mingw64-cmake nasm yasm git cmake || true"
+  trySudoInstall("mingw64-gcc mingw64-gcc-c++ mingw64-binutils " &
+    "mingw64-filesystem mingw64-crt mingw64-headers " &
+    "mingw64-winpthreads-static mingw64-cmake nasm yasm git cmake",
+    "установить mingw-w64 тулчейн")
   result = findHostExe(mingwPrefix & "gcc")
   if result == "":
     echo "[config.nims] [ERROR] " & mingwPrefix & "gcc так и не найден в PATH."
@@ -227,8 +302,7 @@ proc buildX264Windows(src, prefix: string) =
 proc ensureMeson(): void =
   if findHostExe("meson") != "" and findHostExe("ninja") != "": return
   echo "[config.nims] meson/ninja не найдены, пробуем dnf..."
-  if findHostExe("dnf") != "":
-    exec "sudo dnf install -y meson ninja-build || true"
+  trySudoInstall("meson ninja-build", "установить meson/ninja")
   if findHostExe("meson") == "" or findHostExe("ninja") == "":
     echo "[config.nims] [ERROR] meson/ninja так и не найдены в PATH " &
          "(нужны для сборки libdav1d)."
@@ -240,8 +314,7 @@ proc ensureNasm(): void =
   # на чистой системе нужна отдельная проверка именно здесь.
   if findHostExe("nasm") != "": return
   echo "[config.nims] nasm не найден, пробуем dnf..."
-  if findHostExe("dnf") != "":
-    exec "sudo dnf install -y nasm || true"
+  trySudoInstall("nasm", "установить nasm")
 
 # ------------------------------------------------------------------------------
 # libdav1d — чисто программный AV1-декодер (Meson-проект, не зависит от
@@ -319,9 +392,9 @@ proc buildFFmpeg(src, prefix: string; windows: bool; x264Prefix, vidstabPrefix, 
 
   if not windows:
     echo "[config.nims] Проверяем системные зависимости (dnf)..."
-    if findHostExe("dnf") != "":
-      exec "sudo dnf install -y nasm yasm gcc gcc-c++ make cmake pkg-config " &
-           "x264-devel zlib-devel bzip2-devel xz-devel gtk4-devel || true"
+    trySudoInstall("nasm yasm gcc gcc-c++ make cmake pkg-config " &
+      "x264-devel zlib-devel bzip2-devel xz-devel gtk4-devel",
+      "установить системные зависимости сборки FFmpeg")
   # ВАЖНО: сама настройка PKG_CONFIG_LIBDIR/PKG_CONFIG_PATH (включая x264 на
   # Windows) переехала отсюда в orchestration-секцию ниже и выполняется
   # БЕЗУСЛОВНО, а не только когда buildFFmpeg реально запускается — см.
@@ -365,9 +438,20 @@ proc buildFFmpeg(src, prefix: string; windows: bool; x264Prefix, vidstabPrefix, 
         " -L" & bp(dav1dPrefix, "lib") & "\""
     ])
   else:
+    # F-17 из аудита: -march=native раньше стоял безусловно — FFmpeg
+    # собирается один раз и кэшируется в ffmpeg_build/, а сам .a потом
+    # может быть скопирован (или тот же build-каталог использован) на
+    # другой машине с другим CPU; бинарник с инструкциями, которых там
+    # нет, падает с "illegal instruction". FFmpeg и так делает runtime CPU
+    # detection для своих asm-путей (SIMD), поэтому -march=native не нужен
+    # для быстродействия горячих путей — по умолчанию собираем без него
+    # (переносимый baseline текущего gcc target), а -march=native доступен
+    # только как явный локальный opt-in через MONOLIT_NATIVE_ARCH=1 для
+    # тех, кто осознанно собирает "только для этой машины".
+    let archFlag = if getEnv("MONOLIT_NATIVE_ARCH") != "": " -march=native" else: ""
     add(configureFlags, [
       "--enable-pic",
-      "--extra-cflags=\"-O3 -march=native -fPIC -I" & bp(vidstabPrefix, "include") &
+      "--extra-cflags=\"-O3" & archFlag & " -fPIC -I" & bp(vidstabPrefix, "include") &
         " -I" & bp(dav1dPrefix, "include") & "\"",
       "--extra-ldflags=\"-static-libgcc -L" & bp(vidstabPrefix, "lib") &
         " -L" & bp(dav1dPrefix, "lib") &
@@ -440,16 +524,18 @@ proc ensureMingwGtk4() =
 if crossWindows:
   ensureMingwGtk4()
 
-if allLibsExist(libDir):
-  echo fmt"[config.nims] Готовые библиотеки FFmpeg найдены в {libDir} — пропускаем сборку."
+if cacheIsValid(libDir, crossWindows):
+  echo fmt"[config.nims] Готовые библиотеки FFmpeg (совпадающие по сигнатуре сборки) найдены в {libDir} — пропускаем сборку."
 else:
-  echo "[config.nims] Статические библиотеки FFmpeg не найдены, начинаем сборку."
+  echo "[config.nims] Статические библиотеки FFmpeg отсутствуют или устарели " &
+       "(изменились branch/tags/флаги сборки) — начинаем сборку."
   if not fileExists(bp(ffmpegSrc, "configure")):
     cloneRepo("https://github.com/FFmpeg/FFmpeg.git", ffmpegSrc, ffmpegBranch)
   buildFFmpeg(ffmpegSrc, buildDir, crossWindows, x264Build, vidstabPrefix, dav1dPrefix)
   if not allLibsExist(libDir):
     echo "[config.nims] [ERROR] Сборка FFmpeg завершилась, но .a не найдены."
     quit(1)
+  writeFile(buildStampPath(buildDir), ffmpegBuildSignature(crossWindows))
 
 # ------------------------------------------------------------------------------
 # Флаги компилятора/линковщика Nim
@@ -457,6 +543,12 @@ else:
 switch("passC", fmt"-I{incDir}")
 
 if crossWindows:
+  # F-30 из аудита: toolchain и статические зависимости (x264/FFmpeg/dav1d/
+  # vidstab) здесь жёстко нацелены на x86_64-w64-mingw32, но раньше cpu Nim
+  # никак не фиксировался — на не-x86_64 хосте (или если кто-то соберёт с
+  # другим --cpu по привычке) Nim мог выбрать несогласованный target CPU
+  # для генерируемого C-кода при линковке с этими x86_64-only .a/.lib.
+  switch("cpu", "amd64")
   let mingwGcc = ensureMingwToolchain()
   switch("gcc.exe", mingwGcc)
   switch("gcc.linkerexe", mingwGcc)
@@ -509,8 +601,13 @@ switch("mm", "orc")
 switch("threads", "on")
 
 # ------------------------------------------------------------------------------
-# Задача упаковки Windows-дистрибутива: Monolit.exe + рантайм GTK4 рядом.
-# Запуск: nim --os:windows package.nims   (отдельный вспомогательный скрипт,
-# см. README.md) — здесь только напоминание, сама логика вынесена, чтобы
-# не запускать её при каждой обычной компиляции.
+# TODO (F-29 из аудита): упаковка Windows-дистрибутива (Monolit.exe + рантайм
+# GTK4 — DLL, share/glib-2.0/schemas, share/icons — в один раздаваемый
+# каталог) ПОКА НЕ РЕАЛИЗОВАНА. Раньше здесь был комментарий, утверждавший
+# обратное (со ссылкой на несуществующий package.nims) — при кросс-сборке
+# под Windows единственный реальный результат сегодня — Monolit.exe,
+# который не запустится на чистой машине без вручную скопированного рядом
+# рантайма GTK4. Прежде чем распространять Windows-сборки, нужен отдельный
+# воспроизводимый packaging-скрипт с dependency scan и компиляцией GSettings
+# schemas, проверенный на чистой Windows VM (см. review.md, F-29/F-31).
 # ------------------------------------------------------------------------------

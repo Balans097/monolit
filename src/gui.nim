@@ -255,6 +255,8 @@ proc onOpenResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.
           cfg.outputFile = (if len(dir) > 0: dir / ("stabilized." & ext)
                              else: "stabilized." & ext)
           gtk_label_set_text(w.outputLabel, cstring(cfg.outputFile))
+        g_free(cast[pointer](path))
+      g_object_unref(cast[pointer](file))
   gtk_native_dialog_destroy(dialog)
 
 proc onSaveResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.} =
@@ -276,6 +278,8 @@ proc onSaveResponse(dialog: pointer; response: cint; userData: pointer) {.cdecl.
         cfg.outputFile = outPath
         gtk_label_set_text(w.outputLabel, cstring(cfg.outputFile))
         outputExplicit = true
+        g_free(cast[pointer](path))
+      g_object_unref(cast[pointer](file))
   gtk_native_dialog_destroy(dialog)
 
 proc onContainerChanged(dd: pointer; pspec: pointer; userData: pointer) {.cdecl.} =
@@ -698,6 +702,7 @@ proc onProgressTick(userData: pointer): cint {.cdecl.} =
     updateStartButtonLabel()
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
+    timeoutId = 0   # источник уже удаляется GTK через возврат G_SOURCE_REMOVE ниже
     return G_SOURCE_REMOVE
 
   of phaseError:
@@ -706,6 +711,7 @@ proc onProgressTick(userData: pointer): cint {.cdecl.} =
     updateStartButtonLabel()
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
+    timeoutId = 0
     return G_SOURCE_REMOVE
 
   of phaseCancelled:
@@ -714,6 +720,7 @@ proc onProgressTick(userData: pointer): cint {.cdecl.} =
     updateStartButtonLabel()
     gtk_widget_set_sensitive(cast[ptr GtkWidget](w.startButton), cint(1))
     joinThread(procThread)
+    timeoutId = 0
     return G_SOURCE_REMOVE
 
   else:
@@ -768,6 +775,15 @@ proc onCloseRequest(window: pointer; userData: pointer): cint {.cdecl.} =
     requestCancel()
     joinThread(procThread)
     jobRunning = false
+  # F-08 из аудита: если окно закрывают, пока таймер прогресса ещё
+  # запланирован (job шёл в момент закрытия), явно снимаем источник —
+  # раньше timeoutId просто оставался как есть, и при работающем main
+  # context (например, из-за повторной активации приложения — см. F-07)
+  # таймер мог сработать уже после уничтожения/замены виджетов этого окна.
+  if timeoutId != 0:
+    discard g_source_remove(timeoutId)
+    timeoutId = 0
+  w.window = nil  # окно вот-вот будет уничтожено default-обработчиком — не храним dangling pointer
   return cint(0)  # FALSE (GDK_EVENT_PROPAGATE) — разрешить закрытие окна
 
 # ------------------------------------------------------------------------------
@@ -788,6 +804,18 @@ proc onActivate(app: ptr GtkApplication; userData: pointer) {.cdecl.} =
   # локали (LC_MESSAGES и т.п.) не трогаем — переводы/шрифты GTK не
   # страдают.
   discard c_setlocale(LC_NUMERIC, "C")
+
+  # F-07 из аудита: "org.monolit.app" — уникальный application ID, поэтому
+  # повторный запуск обычно не порождает новый процесс, а шлёт "activate"
+  # уже работающему — GTK делает это самостоятельно на уровне GApplication.
+  # Раньше обработчик каждый раз строил НОВОЕ окно и перезаписывал
+  # глобальный w.window, из-за чего старое окно оставалось живо со своими
+  # обработчиками сигналов, но читало/писало уже подменённые глобальные
+  # cfg/jobRunning/procThread нового окна. Здесь — однооконная модель:
+  # если окно уже существует, просто поднимаем его на передний план.
+  if w.window != nil:
+    gtk_window_present(w.window)
+    return
 
   let window = gtk_application_window_new(app)
   w.window = cast[ptr GtkWindow](window)
